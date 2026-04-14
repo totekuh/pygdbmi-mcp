@@ -7,13 +7,15 @@ MCP server for GDB. Uses pygdbmi under the hood.
 ```bash
 git clone https://github.com/totekuh/pygdbmi-mcp.git
 cd pygdbmi-mcp
-python3 -m venv .venv && .venv/bin/pip install -e .
+pipx install .
 ```
+
+This puts `pygdbmi-mcp` on your `PATH`. If you don't have `pipx`, install it with `sudo apt install pipx && pipx ensurepath` (or `python3 -m pip install --user pipx`).
 
 ## Add to Claude Code
 
 ```bash
-claude mcp add pygdbmi-mcp "$(pwd)/.venv/bin/pygdbmi-mcp"
+claude mcp add pygdbmi-mcp -- pygdbmi-mcp
 ```
 
 ## Tools (52)
