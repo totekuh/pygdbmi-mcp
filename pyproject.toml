@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pygdbmi-mcp"
+version = "0.1.0"
+description = "MCP server for GDB debugging via pygdbmi"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "totekuh" }]
+keywords = ["mcp", "gdb", "debugging", "pygdbmi", "reverse-engineering"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pygdbmi>=0.11.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/totekuh/pygdbmi-mcp"
+Repository = "https://github.com/totekuh/pygdbmi-mcp"
+Issues = "https://github.com/totekuh/pygdbmi-mcp/issues"
+
+[project.scripts]
+pygdbmi-mcp = "pygdbmi_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pygdbmi_mcp"]
