@@ -739,7 +739,10 @@ def gdb_load_core(
         load = _reply(session, f"-file-exec-and-symbols {mi_quote(binary)}", 15)
         session.binary = binary
     core = str(Path(core_path).expanduser().resolve())
-    reply = _reply(session, f"-target-select core {mi_quote(core)}", 30)
+    # GDB 15's MI target-select parser leaks quotes into core filenames while
+    # newer GDBs silently accept them. Route this one through the CLI parser,
+    # which handles quoted paths consistently across both generations.
+    reply = _reply(session, f"core-file {cli_quote(core)}", 30)
     session.target_kind = "core"
     session.set_state("stopped")
     session.refresh_target_traits()
