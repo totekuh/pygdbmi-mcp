@@ -4,6 +4,7 @@
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #endif
 
 struct point {
@@ -46,6 +47,24 @@ int main(int argc, char **argv) {
         char input[128];
         if (fgets(input, sizeof(input), stdin)) printf("ECHO:%s", input);
     }
+#ifdef __linux__
+    if (argc > 1 && strcmp(argv[1], "fork") == 0) {
+        pid_t child = fork();
+        if (child == 0) _exit(23);
+        int status = 0;
+        waitpid(child, &status, 0);
+        printf("fork-child-status=%d\n", WEXITSTATUS(status));
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "exec") == 0) {
+        execl(argv[0], argv[0], "exec-child", NULL);
+        return 111;
+    }
+    if (argc > 1 && strcmp(argv[1], "exec-child") == 0) {
+        printf("exec-child\n");
+        return 0;
+    }
+#endif
     int result = add(3, 4);
     printf("add(3, 4) = %d\n", result);
 

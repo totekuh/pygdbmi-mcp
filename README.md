@@ -39,11 +39,14 @@ thread/frame, exit code, architecture, endianness, pointer width, and last
 error. All commands are correlated by numeric GDB/MI tokens through one reader
 thread per session.
 
-Execution tools return as soon as GDB reports `^running`. Use the previous
-`stop_id` with `gdb_wait_for_stop`; then use `gdb_context` for a compact atomic
-snapshot. This avoids mixing evidence from two stops.
+Direct execution tools return as soon as GDB reports `^running`. Use the
+previous `stop_id` with `gdb_wait_for_stop`, or use `gdb_execution_start` plus
+`gdb_execution_status` for a retained start/poll/cancel operation. Jobs survive
+MCP client calls for the lifetime of the server process; they do not pretend to
+survive a server restart. At a stop, use `gdb_context` for a compact atomic
+snapshot so evidence cannot be mixed across stop epochs.
 
-## Tools (65)
+## Tools (73)
 
 ### Session
 | Tool | Description |
@@ -63,6 +66,13 @@ snapshot. This avoids mixing evidence from two stops.
 | `gdb_batch` | Run 1–32 commands atomically, optionally pinned to a `stop_id` |
 | `gdb_inferior_io` | Cursor-page bounded stdout/stderr from a session-owned PTY |
 | `gdb_inferior_stdin` | Write bounded UTF-8, hex, or base64 input to the inferior PTY |
+| `gdb_execution_status` | Read or long-poll a retained execution job by revision |
+| `gdb_execution_list` | List the bounded per-session execution job history |
+| `gdb_execution_cancel` | Idempotently cancel an active/timed-out job by interrupting its target |
+| `gdb_capabilities` | Discover and cache a normalized GDB/MI and target capability manifest |
+| `gdb_inferiors` | Refresh normalized inferior/thread-group topology and history |
+| `gdb_select_inferior` | Select an inferior by stable numeric ID |
+| `gdb_fork_policy` | Apply follow-fork, detach-on-fork, and scheduling policy with rollback |
 
 ### Load target
 | Tool | Description |
@@ -77,6 +87,7 @@ snapshot. This avoids mixing evidence from two stops.
 ### Execute
 | Tool | Description |
 |---|---|
+| `gdb_execution_start` | Start a retained run/continue/step/next/finish/until job |
 | `gdb_run` | Start/restart program |
 | `gdb_continue` | Continue after stop |
 | `gdb_step` | Step into (source or instruction) |
@@ -170,7 +181,16 @@ snapshot. This avoids mixing evidence from two stops.
   vectors use centralized encoding. Embedded raw-command newlines and caller
   supplied MI tokens are rejected.
 - Events, payloads, memory operations, context depth, disassembly, batch size,
-  var-object children, timeouts, and retained command output are bounded.
+  var-object children, timeouts, retained execution jobs, and retained command
+  output are bounded.
+- Execution jobs have monotonic revisions for efficient long polling, explicit
+  terminal states, timeout-without-hidden-interrupt semantics, idempotent
+  cancellation, and bounded oldest-terminal eviction.
+- Inferiors are tracked independently across fork, exec, partial exit, and
+  selection. Local cleanup kills every active inferior instead of trusting one
+  stale selected PID. Fork policy rolls back if a multi-setting update fails.
+- Capability discovery is cached per session, degrades individual failed probes
+  into a manifest `errors` map, and is invalidated when target traits change.
 - MCP tool annotations identify read-only, destructive, idempotent, and
   open-world calls. Server instructions advertise the low-call-count workflow.
 - Target cleanup defaults to kill for local inferiors, detach for attached
@@ -185,5 +205,6 @@ python3 -m venv .venv
 ```
 
 The suite includes fake-controller race/failure tests plus real-GDB local,
-attach, `gdbserver`, core-dump, quoting, paging, A/B context, and edge-case
-integration coverage, including burst output and interactive inferior input.
+attach, `gdbserver`, core-dump, quoting, paging, retained-job A/B and edge cases,
+multi-inferior fork/exec, capability-cache A/B, burst output, and interactive
+inferior input.

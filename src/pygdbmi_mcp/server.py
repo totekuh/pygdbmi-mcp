@@ -34,6 +34,8 @@ CleanupPolicy = Literal["auto", "kill", "detach", "disconnect", "quit"]
 CommandMode = Literal["auto", "mi", "console"]
 RegisterSet = Literal["general", "all"]
 WordSize = Literal[1, 2, 4, 8]
+ExecutionAction = Literal["run", "continue", "step", "next", "finish", "until"]
+FollowFork = Literal["parent", "child"]
 NonNegative = Annotated[int, Field(ge=0)]
 Positive = Annotated[int, Field(ge=1)]
 EventLimit = Annotated[int, Field(ge=1, le=500)]
@@ -41,6 +43,7 @@ WaitTimeout = Annotated[float, Field(ge=0, le=300)]
 CommandTimeout = Annotated[float, Field(ge=0.05, le=300)]
 OutputLimit = Annotated[int, Field(ge=256, le=MAX_OUTPUT_PAGE)]
 InferiorOutputLimit = Annotated[int, Field(ge=1, le=MAX_OUTPUT_PAGE)]
+ExecutionTimeout = Annotated[float, Field(ge=0, le=86400)]
 MemoryCount = Annotated[int, Field(ge=1, le=65536)]
 SmallCount = Annotated[int, Field(ge=1, le=1000)]
 
@@ -62,10 +65,12 @@ mcp = FastMCP(
     "pygdbmi-mcp",
     instructions=(
         "Start with gdb_start and retain session_id. Load, attach, or connect, then use "
-        "execution tools. Execution returns on ^running; call gdb_wait_for_stop with the "
-        "previous stop_id. Prefer gdb_context over many inspection calls. Every tool "
-        "returns pygdbmi.mcp/1; check ok before result. Page large output through "
-        "gdb_output_page and stop sessions explicitly."
+        "execution tools. Prefer gdb_execution_start plus gdb_execution_status for "
+        "retained start/poll/cancel workflows; direct execution returns on ^running and "
+        "uses gdb_wait_for_stop with the previous stop_id. Cache gdb_capabilities, prefer "
+        "gdb_context over many inspection calls, and inspect gdb_inferiors after fork/exec. "
+        "Every tool returns pygdbmi.mcp/1; check ok before result. Page large output "
+        "through gdb_output_page and stop sessions explicitly."
     ),
     lifespan=lifespan,
 )
@@ -145,7 +150,7 @@ def gdb_tool(
                 )
 
         # Keep the wire result structured without repeating the full envelope
-        # schema 63 times in every tools/list response. The versioned fields are
+        # schema for every tool in each tools/list response. The versioned fields are
         # enforced by this wrapper and tested once as a shared contract.
         wrapped.__signature__ = signature.replace(return_annotation=dict[str, Any])  # type: ignore[attr-defined]
         registered = mcp.tool(
@@ -308,6 +313,89 @@ def gdb_inferior_stdin(
 ) -> dict[str, Any]:
     """Write at most 64 KiB to the session-owned inferior PTY."""
     return manager.get(session_id).write_inferior(data, encoding=encoding)
+
+
+@gdb_tool(destructive=True)
+def gdb_execution_start(
+    session_id: str,
+    action: ExecutionAction,
+    instruction: bool = False,
+    location: str = "",
+    timeout_sec: ExecutionTimeout = 0,
+) -> dict[str, Any]:
+    """Start a retained execution operation that completes at a later stop or exit."""
+    return manager.get(session_id).start_execution(
+        action,
+        instruction=instruction,
+        location=location,
+        timeout_sec=float(timeout_sec),
+    )
+
+
+@gdb_tool(read_only=True, idempotent=True)
+def gdb_execution_status(
+    session_id: str,
+    job_id: str,
+    after_revision: NonNegative = 0,
+    wait_timeout: WaitTimeout = 0,
+) -> dict[str, Any]:
+    """Read or long-poll a retained execution operation by revision."""
+    return manager.get(session_id).execution_status(
+        job_id,
+        after_revision=int(after_revision),
+        wait_timeout=float(wait_timeout),
+    )
+
+
+@gdb_tool(read_only=True, idempotent=True)
+def gdb_execution_list(session_id: str) -> dict[str, Any]:
+    """List bounded retained execution operations for a session."""
+    return manager.get(session_id).list_executions()
+
+
+@gdb_tool(destructive=True, idempotent=True)
+def gdb_execution_cancel(
+    session_id: str,
+    job_id: str,
+    timeout_sec: CommandTimeout = 5,
+) -> dict[str, Any]:
+    """Cancel an active execution operation by interrupting the target."""
+    return manager.get(session_id).cancel_execution(
+        job_id, timeout_sec=float(timeout_sec)
+    )
+
+
+@gdb_tool(states=NOT_RUNNING, read_only=True, idempotent=True)
+def gdb_inferiors(session_id: str, refresh: bool = True) -> dict[str, Any]:
+    """Return normalized GDB inferior/thread-group topology."""
+    return manager.get(session_id).inferiors(refresh=refresh)
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True, idempotent=True)
+def gdb_select_inferior(session_id: str, inferior_id: Positive) -> dict[str, Any]:
+    """Select a GDB inferior by its numeric ID."""
+    return manager.get(session_id).select_inferior(int(inferior_id))
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True, idempotent=True)
+def gdb_fork_policy(
+    session_id: str,
+    follow: FollowFork = "parent",
+    detach_on_fork: bool = True,
+    schedule_multiple: bool = False,
+) -> dict[str, Any]:
+    """Set explicit follow-fork, detach-on-fork, and scheduling policy."""
+    return manager.get(session_id).set_fork_policy(
+        follow=follow,
+        detach_on_fork=detach_on_fork,
+        schedule_multiple=schedule_multiple,
+    )
+
+
+@gdb_tool(read_only=True, idempotent=True)
+def gdb_capabilities(session_id: str, refresh: bool = False) -> dict[str, Any]:
+    """Discover or return cached MI, target, architecture, and execution capabilities."""
+    return manager.get(session_id).capabilities(refresh=refresh)
 
 
 _GENERAL_REGISTERS = (
@@ -635,6 +723,7 @@ def gdb_remote_disconnect(session_id: str) -> dict[str, Any]:
     session.selected_thread = None
     session.selected_frame = 0
     session.set_state("idle", clear_stop=True)
+    session.invalidate_capabilities()
     return reply
 
 

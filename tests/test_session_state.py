@@ -16,6 +16,7 @@ import pytest
 from pygdbmi_mcp.contracts import GdbCommandError, GdbMcpError
 from pygdbmi_mcp.runtime import (
     MAX_EVENTS,
+    MAX_EXECUTION_JOBS,
     MAX_INFERIOR_IO,
     GdbManager,
     GdbSession,
@@ -163,6 +164,92 @@ def test_tracks_running_stop_exit_and_target_identity(fake_session) -> None:
     assert session.exit_code == "0"
 
 
+def test_multi_inferior_exit_does_not_fake_global_exit(fake_session) -> None:
+    _, session = fake_session
+    for group_id, pid, thread_id in (("i1", "4101", "1"), ("i2", "4102", "2")):
+        session._route_record(record("notify", "thread-group-added", {"id": group_id}))
+        session._route_record(
+            record(
+                "notify",
+                "thread-group-started",
+                {"id": group_id, "pid": pid},
+            )
+        )
+        session._route_record(
+            record(
+                "notify",
+                "thread-created",
+                {"id": thread_id, "group-id": group_id},
+            )
+        )
+    session._route_record(record("exec", "running", {"thread-id": "all"}))
+    session._route_record(
+        record("notify", "thread-group-exited", {"id": "i2", "exit-code": "027"})
+    )
+    session._route_record(
+        record(
+            "exec",
+            "stopped",
+            {"reason": "exited", "thread-id": "2", "exit-code": "027"},
+        )
+    )
+    assert session.run_state == "stopped"
+    topology = session.inferiors(refresh=False)
+    states = {item["group_id"]: item["state"] for item in topology["inferiors"]}
+    assert states == {"i1": "running", "i2": "exited"}
+    assert topology["active_count"] == 1
+
+    session._route_record(
+        record("notify", "thread-group-exited", {"id": "i1", "exit-code": "0"})
+    )
+    assert session.run_state == "exited"
+    assert session.status()["active_inferior_count"] == 0
+
+
+def test_inferior_refresh_replaces_stale_threads_and_reconciles_states(
+    fake_session,
+) -> None:
+    fake, session = fake_session
+    session.run_state = "stopped"
+    stale = session._ensure_inferior("i1")
+    stale.threads.update({"1", "99"})
+    session._thread_to_group.update({"1": "i1", "99": "i1"})
+    session._ensure_inferior("i2").state = "running"
+
+    fake.handler = lambda token, wire: fake.emit(
+        result(
+            token,
+            "done",
+            {
+                "current-thread-id": "1",
+                "groups": [
+                    {
+                        "id": "i1",
+                        "pid": "4201",
+                        "executable": "/tmp/one",
+                        "threads": [{"id": "1", "state": "stopped"}],
+                    },
+                    {
+                        "id": "i2",
+                        "pid": "4202",
+                        "exit-code": "9",
+                        "threads": [],
+                    },
+                ],
+            },
+        )
+    )
+    topology = session.inferiors()
+    items = {item["group_id"]: item for item in topology["inferiors"]}
+    assert items["i1"]["threads"] == ["1"]
+    assert items["i1"]["state"] == "stopped"
+    assert items["i2"]["state"] == "exited"
+    assert items["i2"]["exit_code"] == "9"
+    assert "99" not in session._thread_to_group
+    assert topology["selected_inferior"] == 1
+    assert topology["active_count"] == 1
+
+
 def test_output_first_page_and_followup_page(fake_session) -> None:
     fake, session = fake_session
     output = "A" * 900
@@ -266,6 +353,327 @@ def test_concurrent_commands_are_serialized(fake_session) -> None:
     assert all(not thread.is_alive() for thread in threads)
     assert fake.max_active_writes == 1
     assert sorted(reply["command_id"] for reply in replies) == [1, 2]
+
+
+def test_execution_job_long_poll_observes_later_stop(fake_session) -> None:
+    fake, session = fake_session
+    session.run_state = "idle"
+
+    def handler(token: int, wire: str) -> None:
+        assert wire == "-exec-run"
+        fake.emit(
+            result(token, "running"), record("exec", "running", {"thread-id": "all"})
+        )
+
+    fake.handler = handler
+    job = session.start_execution("run")
+    assert job["state"] == "running"
+    unchanged = session.execution_status(
+        job["job_id"], after_revision=job["revision"], wait_timeout=0
+    )
+    assert unchanged["revision"] == job["revision"]
+
+    timer = threading.Timer(
+        0.03,
+        fake.emit,
+        args=(
+            record(
+                "exec",
+                "stopped",
+                {"reason": "breakpoint-hit", "thread-id": "1"},
+            ),
+        ),
+    )
+    timer.start()
+    stopped = session.execution_status(
+        job["job_id"], after_revision=job["revision"], wait_timeout=1
+    )
+    timer.join(timeout=1)
+    assert stopped["state"] == "stopped"
+    assert stopped["revision"] > job["revision"]
+    assert stopped["stop_id"] == 1
+    assert session.list_executions() == {
+        "jobs": [stopped],
+        "count": 1,
+        "active_count": 0,
+        "terminal_count": 1,
+        "retention_limit": MAX_EXECUTION_JOBS,
+    }
+
+
+def test_execution_timeout_leaves_target_running_then_cancel_interrupts(
+    fake_session,
+) -> None:
+    fake, session = fake_session
+
+    def handler(token: int, wire: str) -> None:
+        if wire == "-exec-run":
+            fake.emit(
+                result(token, "running"),
+                record("exec", "running", {"thread-id": "all"}),
+            )
+        elif wire == "-exec-interrupt --all":
+            fake.emit(
+                result(token, "done"),
+                record(
+                    "exec",
+                    "stopped",
+                    {"reason": "signal-received", "thread-id": "1"},
+                ),
+            )
+        else:
+            raise AssertionError(wire)
+
+    fake.handler = handler
+    job = session.start_execution("run", timeout_sec=0.03)
+    timed_out = session.execution_status(
+        job["job_id"], after_revision=job["revision"], wait_timeout=1
+    )
+    assert timed_out["state"] == "timed_out"
+    assert timed_out["error"]["code"] == "execution_timeout"
+    assert session.run_state == "running"
+    assert not any(write.endswith("-exec-interrupt --all") for write in fake.writes)
+
+    cancelled = session.cancel_execution(job["job_id"], timeout_sec=1)
+    assert cancelled["already_terminal"] is False
+    assert cancelled["job"]["state"] == "cancelled"
+    assert cancelled["job"]["cancel_requested"] is True
+    assert session.run_state == "stopped"
+    again = session.cancel_execution(job["job_id"], timeout_sec=1)
+    assert again["already_terminal"] is True
+
+
+def test_failed_execution_is_retained_with_job_id(fake_session) -> None:
+    fake, session = fake_session
+    fake.handler = lambda token, wire: fake.emit(
+        result(token, "error", {"msg": "Cannot execute"})
+    )
+    with pytest.raises(GdbMcpError) as caught:
+        session.start_execution("run")
+    assert caught.value.code == "gdb_error"
+    job_id = caught.value.details["job_id"]
+    retained = session.execution_status(job_id)
+    assert retained["state"] == "failed"
+    assert retained["error"] == {"code": "gdb_error", "message": "Cannot execute"}
+
+
+def test_execution_retention_prunes_oldest_terminal_job(fake_session) -> None:
+    fake, session = fake_session
+
+    def handler(token: int, wire: str) -> None:
+        fake.emit(
+            result(token, "running"),
+            record("exec", "running", {"thread-id": "all"}),
+            record("exec", "stopped", {"reason": "end-stepping-range"}),
+        )
+
+    fake.handler = handler
+    for _ in range(MAX_EXECUTION_JOBS + 1):
+        assert session.start_execution("run")["state"] == "stopped"
+    listing = session.list_executions()
+    assert listing["count"] == MAX_EXECUTION_JOBS
+    assert listing["jobs"][0]["job_id"] == "exec-2"
+    assert listing["jobs"][-1]["job_id"] == f"exec-{MAX_EXECUTION_JOBS + 1}"
+    with pytest.raises(GdbMcpError) as caught:
+        session.execution_status("exec-1")
+    assert caught.value.code == "execution_not_found"
+
+
+@pytest.mark.parametrize(
+    ("call", "code"),
+    [
+        (lambda session: session.start_execution("warp"), "invalid_argument"),
+        (lambda session: session.start_execution("until"), "invalid_argument"),
+        (
+            lambda session: session.start_execution("run", location="main"),
+            "invalid_argument",
+        ),
+        (
+            lambda session: session.start_execution("run", instruction="yes"),  # type: ignore[arg-type]
+            "invalid_argument",
+        ),
+        (
+            lambda session: session.start_execution("until", location="main\nquit"),
+            "invalid_argument",
+        ),
+        (
+            lambda session: session.start_execution("run", timeout_sec=-1),
+            "invalid_argument",
+        ),
+        (
+            lambda session: session.execution_status("missing"),
+            "execution_not_found",
+        ),
+        (
+            lambda session: session.execution_status("exec-1", after_revision=-1),
+            "invalid_argument",
+        ),
+        (
+            lambda session: session.cancel_execution("exec-1", timeout_sec=0),
+            "invalid_argument",
+        ),
+    ],
+)
+def test_execution_job_edge_validation(fake_session, call, code) -> None:
+    _, session = fake_session
+    with pytest.raises(GdbMcpError) as caught:
+        call(session)
+    assert caught.value.code == code
+
+
+def test_session_close_cancels_active_execution_job(fake_session) -> None:
+    fake, session = fake_session
+    fake.handler = lambda token, wire: fake.emit(
+        result(token, "running"), record("exec", "running", {"thread-id": "all"})
+    )
+    job = session.start_execution("run")
+    session.target_kind = "none"
+    session.close("quit")
+    retained = session.execution_status(job["job_id"])
+    assert retained["state"] == "cancelled"
+    assert retained["error"]["code"] == "session_closed"
+
+
+def test_capabilities_cache_refresh_and_running_policy(fake_session) -> None:
+    fake, session = fake_session
+
+    def handler(token: int, wire: str) -> None:
+        if wire == "-list-features":
+            fake.emit(result(token, "done", {"features": ["frozen-varobjs", "async"]}))
+        elif wire == "-list-target-features":
+            fake.emit(result(token, "done", {"features": ["async"]}))
+        elif "show osabi" in wire:
+            fake.emit(
+                record(
+                    "console",
+                    None,
+                    'The current OS ABI is "auto" (currently "GNU/Linux").\n',
+                ),
+                result(token, "done"),
+            )
+        elif "show non-stop" in wire:
+            fake.emit(
+                record(
+                    "console",
+                    None,
+                    "Controlling the inferior in non-stop mode is off.\n",
+                ),
+                result(token, "done"),
+            )
+        elif wire.startswith("-info-gdb-mi-command"):
+            fake.emit(result(token, "done", {"command": {"exists": "true"}}))
+        else:
+            raise AssertionError(wire)
+
+    fake.handler = handler
+    first = session.capabilities()
+    write_count = len(fake.writes)
+    assert first["cached"] is False
+    assert first["osabi"] == "GNU/Linux"
+    assert first["osabi_setting"] == "auto"
+    assert first["mi_features"] == ["async", "frozen-varobjs"]
+    assert all(first["mi_commands"].values())
+
+    second = session.capabilities()
+    assert second["cached"] is True
+    assert second["discovered_at"] == first["discovered_at"]
+    assert len(fake.writes) == write_count
+
+    session.run_state = "running"
+    assert session.capabilities()["cached"] is True
+    with pytest.raises(GdbMcpError) as caught:
+        session.capabilities(refresh=True)
+    assert caught.value.code == "invalid_state"
+    session.run_state = "stopped"
+    refreshed = session.capabilities(refresh=True)
+    assert refreshed["cached"] is False
+    assert len(fake.writes) == write_count * 2
+    session.invalidate_capabilities()
+    assert session.status()["capabilities_cached_at"] is None
+
+    barrier = threading.Barrier(3)
+    concurrent: list[dict] = []
+
+    def discover() -> None:
+        barrier.wait()
+        concurrent.append(session.capabilities())
+
+    threads = [threading.Thread(target=discover) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(item["cached"] for item in concurrent) == [False, True]
+    assert len(fake.writes) == write_count * 3
+
+
+def test_capabilities_degrade_per_probe_instead_of_losing_manifest(
+    fake_session,
+) -> None:
+    fake, session = fake_session
+
+    def handler(token: int, wire: str) -> None:
+        if wire == "-list-target-features":
+            fake.emit(result(token, "error", {"msg": "unsupported"}))
+        elif wire.startswith("-list-"):
+            fake.emit(result(token, "done", {"features": []}))
+        elif wire.startswith("-info-gdb-mi-command"):
+            fake.emit(result(token, "done", {"command": {"exists": "false"}}))
+        else:
+            fake.emit(result(token, "done"))
+
+    fake.handler = handler
+    capabilities = session.capabilities()
+    assert capabilities["cached"] is False
+    assert capabilities["target_features"] == []
+    assert capabilities["errors"]["target_features"] == "gdb_error: unsupported"
+    assert not any(capabilities["mi_commands"].values())
+
+
+def test_fork_policy_rolls_back_partial_failure(fake_session) -> None:
+    fake, session = fake_session
+
+    def handler(token: int, wire: str) -> None:
+        if wire == "-gdb-set detach-on-fork off":
+            fake.emit(result(token, "error", {"msg": "detach setting rejected"}))
+        else:
+            fake.emit(result(token, "done"))
+
+    fake.handler = handler
+    with pytest.raises(GdbMcpError) as caught:
+        session.set_fork_policy(
+            follow="child", detach_on_fork=False, schedule_multiple=True
+        )
+    assert caught.value.code == "gdb_error"
+    assert caught.value.details["applied_before_failure"] == ["follow"]
+    assert caught.value.details["rollback_errors"] == []
+    assert session.fork_policy == {
+        "follow": "parent",
+        "detach_on_fork": True,
+        "schedule_multiple": False,
+    }
+    assert [re.match(r"^\d+(.*)$", write).group(1) for write in fake.writes] == [
+        "-gdb-set follow-fork-mode child",
+        "-gdb-set detach-on-fork off",
+        "-gdb-set follow-fork-mode parent",
+    ]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"follow": "neither", "detach_on_fork": True, "schedule_multiple": False},
+        {"follow": "parent", "detach_on_fork": "yes", "schedule_multiple": False},
+        {"follow": "parent", "detach_on_fork": True, "schedule_multiple": 1},
+    ],
+)
+def test_fork_policy_rejects_invalid_edges(fake_session, kwargs) -> None:
+    _, session = fake_session
+    with pytest.raises(GdbMcpError) as caught:
+        session.set_fork_policy(**kwargs)
+    assert caught.value.code == "invalid_argument"
 
 
 def test_auto_cleanup_policy_matches_target_kind() -> None:

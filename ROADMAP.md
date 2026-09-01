@@ -45,6 +45,24 @@ The command surface remains additive. Version 0.2 intentionally changes tool
 results from ad-hoc strings to the versioned envelope; pretending that machine
 clients benefit from prose errors was not a compatibility worth preserving.
 
+## Shipped in 0.3
+
+- A bounded per-session execution-job registry for run, continue, step, next,
+  finish, and until. Jobs expose monotonic revisions, long polling, retained
+  terminal results, explicit timeout-without-interrupt behavior, cancellation,
+  and oldest-terminal eviction. This survives client calls, not MCP server
+  process death.
+- Normalized inferior/thread-group history with per-inferior PID, state,
+  threads, exit code, executable, last stop, and exec count. Partial child exit
+  no longer turns a live parent into a globally exited session.
+- Inferior selection and transactional follow-fork/detach-on-fork/
+  schedule-multiple policy with best-effort rollback on partial failure.
+- Cached normalized capability manifests covering MI and target features,
+  command availability, OS ABI, non-stop mode, architecture, endianness, pointer
+  width, PTY support, and bounded per-probe errors.
+- Multi-inferior local cleanup addresses every active inferior. The selected
+  child being dead is no longer enough to leak its living parent.
+
 ## Completed — harden the MI boundary
 
 1. Persistent reader and numeric MI correlation — done.
@@ -59,16 +77,15 @@ clients benefit from prose errors was not a compatibility worth preserving.
 1. Inferior PTY ownership and bounded combined stdout/stderr plus stdin tools —
    shipped. Separate stdout/stderr is not possible through one Unix PTY; add a
    pipe mode later only if a real workflow needs the distinction.
-2. Add a durable optional broker if execution must survive an MCP server process
-   restart. Within one server lifetime, `run`/`continue`, stop epochs,
-   `gdb_wait_for_stop`, and `gdb_interrupt` already provide start/poll/cancel
-   semantics without holding a synchronous call open.
+2. Server-lifetime retained execution jobs — shipped in 0.3. Add a durable
+   optional broker only if execution must survive an MCP server process restart.
 3. Atomic bounded batches and stop-pinned optional context memory — shipped.
-4. Normalized register maps, register-name caching, and basic target traits —
-   shipped. Capability/feature XML normalization remains.
+4. Normalized register maps, register-name caching, target traits, and cached
+   MI/target capability manifests — shipped. Parse remote feature XML later only
+   when a consumer needs register-description detail beyond GDB's own model.
 5. GDB/MI variable-object create/update/children/assign/delete — shipped.
-6. Support multi-inferior/fork/exec state explicitly, including follow-fork and
-   detach-on-fork policies without pretending one PID field is the universe.
+6. Multi-inferior/fork/exec state, selection, cleanup, and fork policy — shipped
+   in 0.3.
 
 ## P3 — reverse-engineering and post-mortem depth
 
@@ -96,16 +113,17 @@ clients benefit from prose errors was not a compatibility worth preserving.
   results, reader death, stop epochs, cursor gaps, event/output bounds,
   concurrency, timeouts/recovery, cleanup policy, quoting, envelopes, schemas,
   annotations, constraints, and catalog size/identity.
-- Real-GDB coverage invokes all 65 tools across local run/stop/exit, attach and
+- Real-GDB coverage invokes all 73 tools across local run/stop/exit, attach and
   detach, async interrupt, remote `gdbserver`, core files with spaces,
   breakpoints/watchpoints/catchpoints, command paging, atomic batches, compact
   versus expanded context, settings restoration, variable objects, burst PTY
-  output, and interactive stdin.
+  output, interactive stdin, retained job timeout/cancel, cached capabilities,
+  multi-inferior selection, fork child/parent exit, and exec attribution.
 - CI runs the suite on Python 3.10–3.13 with GDB, gdbserver, and GCC.
 
-Still worth adding: multi-thread/fork/exec regression targets, stripped PIE and
-split-debug fixtures, large C++ var-object trees, non-x86 architecture CI, and a
-real noisy interactive inferior once PTY ownership lands.
+Still worth adding: multi-thread non-stop regression targets, stripped PIE and
+split-debug fixtures, large C++ var-object trees, non-x86 architecture CI, and
+an optional process broker only if restart persistence becomes a real need.
 
 ## Non-goals
 

@@ -35,6 +35,16 @@ from .contracts import (
 
 RunState = Literal["idle", "running", "stopped", "exited", "indeterminate"]
 TargetKind = Literal["none", "local", "attached", "remote", "core"]
+JobState = Literal[
+    "starting",
+    "running",
+    "cancelling",
+    "stopped",
+    "exited",
+    "cancelled",
+    "timed_out",
+    "failed",
+]
 
 MAX_EVENTS = 1024
 MAX_EVENT_STRING = 64 * 1024
@@ -45,6 +55,7 @@ MAX_STORED_OUTPUTS = 32
 MAX_NOTIFICATIONS = 128
 MAX_INFERIOR_IO = 1024 * 1024
 MAX_INFERIOR_WRITE = 64 * 1024
+MAX_EXECUTION_JOBS = 32
 
 
 def mi_quote(value: object) -> str:
@@ -118,6 +129,96 @@ class _PendingCommand:
             )
 
 
+@dataclass
+class _InferiorRecord:
+    group_id: str
+    inferior_id: int | None = None
+    pid: int | None = None
+    state: str = "added"
+    executable: str | None = None
+    exit_code: str | None = None
+    threads: set[str] = field(default_factory=set)
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    exec_count: int = 0
+    last_stop: dict[str, Any] | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "group_id": self.group_id,
+            "inferior_id": self.inferior_id,
+            "pid": self.pid,
+            "state": self.state,
+            "executable": self.executable,
+            "exit_code": self.exit_code,
+            "threads": sorted(self.threads, key=_numeric_sort_key),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "exec_count": self.exec_count,
+            "last_stop": bounded_value(self.last_stop),
+        }
+
+
+@dataclass
+class _ExecutionJob:
+    job_id: str
+    action: str
+    command: str
+    baseline_stop_id: int
+    start_io_cursor: int
+    timeout_sec: float
+    created_at: float = field(default_factory=time.time)
+    state: JobState = "starting"
+    revision: int = 1
+    command_reply: CommandReply | None = None
+    error: dict[str, Any] | None = None
+    completed_at: float | None = None
+    stop_id: int | None = None
+    end_io_cursor: int | None = None
+    cancel_requested: bool = False
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in {
+            "stopped",
+            "exited",
+            "cancelled",
+            "timed_out",
+            "failed",
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "action": self.action,
+            "command": self.command,
+            "state": self.state,
+            "revision": self.revision,
+            "baseline_stop_id": self.baseline_stop_id,
+            "stop_id": self.stop_id,
+            "start_io_cursor": self.start_io_cursor,
+            "end_io_cursor": self.end_io_cursor,
+            "timeout_sec": self.timeout_sec,
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+            "command_reply": bounded_value(self.command_reply),
+            "error": bounded_value(self.error),
+            "cancel_requested": self.cancel_requested,
+        }
+
+
+def _numeric_sort_key(value: str) -> tuple[int, str]:
+    try:
+        return (int(value), value)
+    except ValueError:
+        return (2**31 - 1, value)
+
+
+def _inferior_number(group_id: str) -> int | None:
+    match = re.fullmatch(r"i(\d+)", group_id)
+    return int(match.group(1)) if match else None
+
+
 class GdbSession:
     """One GDB process, one MI reader, and one serialized command stream."""
 
@@ -154,6 +255,12 @@ class GdbSession:
         self.register_names: list[str] | None = None
         self.inferior_tty_enabled = bool(inferior_tty)
         self.inferior_tty_path: str | None = None
+        self.selected_inferior: int | None = None
+        self.fork_policy: dict[str, Any] = {
+            "follow": "parent",
+            "detach_on_fork": True,
+            "schedule_multiple": False,
+        }
 
         self.command_lock = threading.RLock()
         self.condition = threading.Condition(threading.RLock())
@@ -163,6 +270,12 @@ class GdbSession:
         self._event_cursor = 0
         self._events: deque[dict[str, Any]] = deque(maxlen=MAX_EVENTS)
         self._outputs: OrderedDict[int, str] = OrderedDict()
+        self._inferiors: OrderedDict[str, _InferiorRecord] = OrderedDict()
+        self._thread_to_group: dict[str, str] = {}
+        self._execution_jobs: OrderedDict[str, _ExecutionJob] = OrderedDict()
+        self._next_job_id = 0
+        self._capabilities: dict[str, Any] | None = None
+        self._capabilities_at: float | None = None
         self._closing = threading.Event()
         self._reader_error: BaseException | None = None
         self._pty_master: int | None = None
@@ -212,6 +325,15 @@ class GdbSession:
             return {"closed": True, "already_closed": True, "policy": policy}
         cleanup = self._cleanup_target(policy)
         self._closing.set()
+        with self.condition:
+            for job in self._execution_jobs.values():
+                if not job.terminal:
+                    self._finish_job(
+                        job,
+                        "cancelled",
+                        error={"code": "session_closed", "message": "session closed"},
+                    )
+            self.condition.notify_all()
         try:
             self.controller.exit()
         except Exception as exc:  # noqa: BLE001 - best-effort third-party teardown
@@ -318,6 +440,11 @@ class GdbSession:
             "applied_policy": selected,
             "target_kind": self.target_kind,
             "errors": [],
+            "inferiors": [
+                inferior.inferior_id
+                for inferior in self._active_inferiors()
+                if inferior.inferior_id is not None
+            ],
         }
         command = {
             "kill": "kill",
@@ -325,6 +452,10 @@ class GdbSession:
             "disconnect": "-target-disconnect",
             "quit": None,
         }[selected]
+        if selected == "kill" and result["inferiors"]:
+            command = "kill inferiors " + " ".join(
+                str(inferior_id) for inferior_id in result["inferiors"]
+            )
         if command is not None and self.target_kind != "none":
             try:
                 self.execute(command, timeout_sec=5.0)
@@ -521,21 +652,143 @@ class GdbSession:
             self._update_state(record_type, message, payload)
             self.condition.notify_all()
 
+    def _ensure_inferior(self, group_id: str) -> _InferiorRecord:
+        inferior = self._inferiors.get(group_id)
+        if inferior is None:
+            inferior = _InferiorRecord(
+                group_id=group_id,
+                inferior_id=_inferior_number(group_id),
+            )
+            self._inferiors[group_id] = inferior
+        inferior.updated_at = time.time()
+        return inferior
+
+    def _group_from_payload(self, payload: dict[str, Any]) -> str | None:
+        direct = payload.get("thread-group") or payload.get("group-id")
+        if direct is not None:
+            return str(direct)
+        thread_id = payload.get("thread-id") or payload.get("id")
+        return (
+            self._thread_to_group.get(str(thread_id)) if thread_id is not None else None
+        )
+
+    def _active_inferiors(self) -> list[_InferiorRecord]:
+        return [
+            inferior
+            for inferior in self._inferiors.values()
+            if inferior.state in {"running", "stopped", "started"}
+        ]
+
     def _update_state(self, record_type: Any, message: Any, payload: Any) -> None:
+        data = payload if isinstance(payload, dict) else {}
+
+        if record_type == "notify" and message == "thread-group-added":
+            group_id = str(data.get("id") or "")
+            if group_id:
+                self._ensure_inferior(group_id).state = "added"
+                if self.thread_group is None:
+                    self.thread_group = group_id
+                    self.selected_inferior = _inferior_number(group_id)
+            return
+
+        if record_type == "notify" and message == "thread-group-started":
+            group_id = str(data.get("id") or self.thread_group or "")
+            if group_id:
+                inferior = self._ensure_inferior(group_id)
+                inferior.state = "started"
+                raw_pid = data.get("pid")
+                try:
+                    inferior.pid = int(raw_pid) if raw_pid is not None else inferior.pid
+                except (TypeError, ValueError):
+                    pass
+                self.thread_group = group_id
+                self.selected_inferior = inferior.inferior_id
+                self.pid = inferior.pid
+            return
+
+        if record_type == "notify" and message == "thread-group-exited":
+            group_id = str(data.get("id") or self.thread_group or "")
+            if group_id:
+                inferior = self._ensure_inferior(group_id)
+                inferior.state = "exited"
+                code = data.get("exit-code")
+                inferior.exit_code = (
+                    str(code) if code is not None else inferior.exit_code
+                )
+                if group_id == self.thread_group:
+                    self.exit_code = inferior.exit_code
+            if not self._active_inferiors():
+                self.run_state = "exited"
+            return
+
+        if record_type == "notify" and message == "thread-group-removed":
+            group_id = str(data.get("id") or "")
+            if group_id:
+                self._ensure_inferior(group_id).state = "removed"
+            return
+
+        if record_type == "notify" and message == "thread-created":
+            thread_id = str(data.get("id") or "")
+            group_id = str(data.get("group-id") or "")
+            if thread_id and group_id:
+                self._thread_to_group[thread_id] = group_id
+                self._ensure_inferior(group_id).threads.add(thread_id)
+            return
+
+        if record_type == "notify" and message == "thread-exited":
+            thread_id = str(data.get("id") or "")
+            group_id = str(
+                data.get("group-id") or self._thread_to_group.get(thread_id) or ""
+            )
+            if group_id:
+                self._ensure_inferior(group_id).threads.discard(thread_id)
+            self._thread_to_group.pop(thread_id, None)
+            return
+
         if message == "running" and record_type in {"result", "exec", "notify"}:
             self.run_state = "running"
             self.last_stop = None
+            group_id = self._group_from_payload(data)
+            candidates = (
+                [self._ensure_inferior(group_id)]
+                if group_id
+                else [
+                    inferior
+                    for inferior in self._inferiors.values()
+                    if inferior.state not in {"exited", "removed"}
+                ]
+            )
+            for inferior in candidates:
+                inferior.state = "running"
+                inferior.updated_at = time.time()
             return
+
         if message == "stopped" and record_type in {"exec", "notify"}:
-            stop = payload if isinstance(payload, dict) else {"raw": payload}
+            stop = data if isinstance(payload, dict) else {"raw": payload}
             self.last_stop = stop
             self.stop_id += 1
             reason = stop.get("reason")
-            self.run_state = (
-                "exited"
-                if isinstance(reason, str) and reason.startswith("exited")
-                else "stopped"
-            )
+            group_id = self._group_from_payload(stop) or self.thread_group
+            inferior = self._ensure_inferior(group_id) if group_id else None
+            exited = isinstance(reason, str) and reason.startswith("exited")
+            self.run_state = "stopped"
+            if inferior is not None:
+                inferior.state = "exited" if exited else "stopped"
+                inferior.last_stop = bounded_value(stop)
+                if reason in {"exec", "exec-called"}:
+                    inferior.exec_count += 1
+                    self._capabilities = None
+                    self._capabilities_at = None
+                    frame = stop.get("frame")
+                    if isinstance(frame, dict):
+                        executable = frame.get("fullname") or frame.get("file")
+                        if executable:
+                            inferior.executable = str(executable)
+                self.thread_group = inferior.group_id
+                self.selected_inferior = inferior.inferior_id
+                self.pid = inferior.pid
+            if exited and not self._active_inferiors():
+                self.run_state = "exited"
             thread_id = stop.get("thread-id")
             try:
                 self.selected_thread = int(thread_id) if thread_id is not None else None
@@ -543,24 +796,7 @@ class GdbSession:
                 self.selected_thread = None
             self.selected_frame = 0
             return
-        if record_type == "notify" and message == "thread-group-exited":
-            self.run_state = "exited"
-            if isinstance(payload, dict):
-                self.thread_group = (
-                    str(payload.get("id") or self.thread_group or "") or None
-                )
-                code = payload.get("exit-code")
-                self.exit_code = str(code) if code is not None else self.exit_code
-            return
-        if record_type == "notify" and message == "thread-group-started":
-            if isinstance(payload, dict):
-                self.thread_group = str(payload.get("id") or "") or self.thread_group
-                raw_pid = payload.get("pid")
-                try:
-                    self.pid = int(raw_pid) if raw_pid is not None else self.pid
-                except (TypeError, ValueError):
-                    pass
-            return
+
         if (
             record_type == "notify"
             and message == "thread-selected"
@@ -573,6 +809,12 @@ class GdbSession:
                 )
             except (TypeError, ValueError):
                 pass
+            group_id = self._group_from_payload(data)
+            if group_id:
+                inferior = self._ensure_inferior(group_id)
+                self.thread_group = group_id
+                self.selected_inferior = inferior.inferior_id
+                self.pid = inferior.pid
 
     # -- state, events, and output paging --------------------------------
 
@@ -600,6 +842,17 @@ class GdbSession:
                 "inferior_tty": self.inferior_tty_path,
                 "inferior_io_cursor": self._io_cursor,
                 "inferior_io_base_cursor": self._io_base_cursor,
+                "selected_inferior": self.selected_inferior,
+                "inferior_count": len(self._inferiors),
+                "active_inferior_count": len(self._active_inferiors()),
+                "inferiors": [item.snapshot() for item in self._inferiors.values()],
+                "fork_policy": dict(self.fork_policy),
+                "active_execution_jobs": [
+                    job.job_id
+                    for job in self._execution_jobs.values()
+                    if not job.terminal
+                ],
+                "capabilities_cached_at": self._capabilities_at,
             }
 
     def events(
@@ -694,6 +947,534 @@ class GdbSession:
                 retryable=True,
             )
         return {"interrupt_sent": True, "method": method, **result}
+
+    # -- retained execution operations ----------------------------------
+
+    def start_execution(
+        self,
+        action: str,
+        *,
+        instruction: bool = False,
+        location: str = "",
+        timeout_sec: float = 0.0,
+    ) -> dict[str, Any]:
+        if not isinstance(action, str):
+            raise GdbMcpError("action must be a string", code="invalid_argument")
+        if not isinstance(instruction, bool):
+            raise GdbMcpError("instruction must be boolean", code="invalid_argument")
+        if (
+            not isinstance(location, str)
+            or len(location) > 4096
+            or any(char in location for char in "\r\n\x00")
+        ):
+            raise GdbMcpError(
+                "location must be a single string of at most 4096 characters",
+                code="invalid_argument",
+            )
+        if isinstance(timeout_sec, bool) or not 0 <= timeout_sec <= 86_400:
+            raise GdbMcpError(
+                "timeout_sec must be between 0 and 86400", code="invalid_argument"
+            )
+        commands = {
+            "run": "-exec-run",
+            "continue": "-exec-continue",
+            "step": "-exec-step-instruction" if instruction else "-exec-step",
+            "next": "-exec-next-instruction" if instruction else "-exec-next",
+            "finish": "-exec-finish",
+            "until": f"-exec-until {mi_quote(location)}" if location else "",
+        }
+        if action not in commands:
+            raise GdbMcpError(
+                "action must be run, continue, step, next, finish, or until",
+                code="invalid_argument",
+            )
+        if action == "until" and not location:
+            raise GdbMcpError("until requires location", code="invalid_argument")
+        if action != "until" and location:
+            raise GdbMcpError(
+                "location is only valid for until", code="invalid_argument"
+            )
+        allowed = {"idle", "stopped", "exited"} if action == "run" else {"stopped"}
+        with self.command_lock:
+            if self.run_state not in allowed:
+                raise GdbMcpError(
+                    f"cannot {action} while the session is {self.run_state}",
+                    code="invalid_state",
+                    details={
+                        "run_state": self.run_state,
+                        "allowed_states": sorted(allowed),
+                    },
+                )
+            self._prune_execution_jobs()
+            with self.condition:
+                active = [
+                    job.job_id
+                    for job in self._execution_jobs.values()
+                    if not job.terminal
+                ]
+                if active:
+                    raise GdbMcpError(
+                        "an execution operation is already active",
+                        code="execution_active",
+                        details={"active_jobs": active},
+                    )
+                self._next_job_id += 1
+                job = _ExecutionJob(
+                    job_id=f"exec-{self._next_job_id}",
+                    action=action,
+                    command=commands[action],
+                    baseline_stop_id=self.stop_id,
+                    start_io_cursor=self._io_cursor,
+                    timeout_sec=float(timeout_sec),
+                )
+                self._execution_jobs[job.job_id] = job
+            try:
+                reply = self.execute(job.command, timeout_sec=30.0)
+            except GdbMcpError as exc:
+                with self.condition:
+                    self._finish_job(
+                        job,
+                        "failed",
+                        error={"code": exc.code, "message": exc.message},
+                    )
+                    self.condition.notify_all()
+                raise GdbMcpError(
+                    exc.message,
+                    code=exc.code,
+                    retryable=exc.retryable,
+                    details={**exc.details, "job_id": job.job_id},
+                    recovery=exc.recovery,
+                ) from exc
+            with self.condition:
+                job.command_reply = reply
+                if self.run_state == "exited":
+                    self._finish_job(job, "exited")
+                elif (
+                    self.run_state == "stopped" and self.stop_id > job.baseline_stop_id
+                ):
+                    self._finish_job(job, "stopped")
+                else:
+                    job.state = "running"
+                    job.revision += 1
+                self.condition.notify_all()
+            if not job.terminal:
+                threading.Thread(
+                    target=self._watch_execution,
+                    args=(job.job_id,),
+                    name=f"pygdbmi-execution-{self.session_id}-{job.job_id}",
+                    daemon=True,
+                ).start()
+            return job.snapshot()
+
+    def _watch_execution(self, job_id: str) -> None:
+        started = time.monotonic()
+        with self.condition:
+            while not self._closing.is_set():
+                job = self._execution_jobs.get(job_id)
+                if job is None or job.terminal:
+                    return
+                if job.cancel_requested and self.run_state != "running":
+                    self._finish_job(job, "cancelled")
+                    self.condition.notify_all()
+                    return
+                if self.run_state == "exited":
+                    self._finish_job(job, "exited")
+                    self.condition.notify_all()
+                    return
+                if self.run_state == "stopped" and self.stop_id > job.baseline_stop_id:
+                    self._finish_job(job, "stopped")
+                    self.condition.notify_all()
+                    return
+                remaining = None
+                if job.timeout_sec:
+                    remaining = job.timeout_sec - (time.monotonic() - started)
+                    if remaining <= 0:
+                        self._finish_job(
+                            job,
+                            "timed_out",
+                            error={
+                                "code": "execution_timeout",
+                                "message": "execution operation timed out; target was not interrupted",
+                            },
+                        )
+                        self.condition.notify_all()
+                        return
+                self.condition.wait(remaining if remaining is not None else 30.0)
+
+    def _finish_job(
+        self,
+        job: _ExecutionJob,
+        state: JobState,
+        *,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        job.state = state
+        job.error = bounded_value(error) if error else None
+        job.completed_at = time.time()
+        job.stop_id = self.stop_id
+        job.end_io_cursor = self._io_cursor
+        job.revision += 1
+
+    def _prune_execution_jobs(self) -> None:
+        with self.condition:
+            while len(self._execution_jobs) >= MAX_EXECUTION_JOBS:
+                removable = next(
+                    (
+                        job_id
+                        for job_id, job in self._execution_jobs.items()
+                        if job.terminal
+                    ),
+                    None,
+                )
+                if removable is None:
+                    raise GdbMcpError(
+                        "execution job retention is full",
+                        code="execution_jobs_full",
+                    )
+                self._execution_jobs.pop(removable)
+
+    def execution_status(
+        self,
+        job_id: str,
+        *,
+        after_revision: int = 0,
+        wait_timeout: float = 0.0,
+    ) -> dict[str, Any]:
+        if isinstance(after_revision, bool) or after_revision < 0:
+            raise GdbMcpError(
+                "after_revision must be non-negative", code="invalid_argument"
+            )
+        if isinstance(wait_timeout, bool) or not 0 <= wait_timeout <= 300:
+            raise GdbMcpError(
+                "wait_timeout must be between 0 and 300", code="invalid_argument"
+            )
+        deadline = time.monotonic() + wait_timeout
+        with self.condition:
+            while True:
+                job = self._execution_jobs.get(job_id)
+                if job is None:
+                    raise GdbMcpError(
+                        f"execution job {job_id!r} is not retained",
+                        code="execution_not_found",
+                    )
+                if job.revision > after_revision or job.terminal:
+                    return job.snapshot()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return job.snapshot()
+                self.condition.wait(remaining)
+
+    def list_executions(self) -> dict[str, Any]:
+        with self.condition:
+            jobs = [job.snapshot() for job in self._execution_jobs.values()]
+            active_count = sum(
+                not job.terminal for job in self._execution_jobs.values()
+            )
+            return {
+                "jobs": jobs,
+                "count": len(jobs),
+                "active_count": active_count,
+                "terminal_count": len(jobs) - active_count,
+                "retention_limit": MAX_EXECUTION_JOBS,
+            }
+
+    def cancel_execution(
+        self, job_id: str, *, timeout_sec: float = 5.0
+    ) -> dict[str, Any]:
+        if isinstance(timeout_sec, bool) or not 0.05 <= timeout_sec <= 300:
+            raise GdbMcpError(
+                "timeout_sec must be between 0.05 and 300", code="invalid_argument"
+            )
+        with self.condition:
+            job = self._execution_jobs.get(job_id)
+            if job is None:
+                raise GdbMcpError(
+                    f"execution job {job_id!r} is not retained",
+                    code="execution_not_found",
+                )
+            if job.terminal and not (
+                job.state == "timed_out" and self.run_state == "running"
+            ):
+                return {"already_terminal": True, "job": job.snapshot()}
+            job.cancel_requested = True
+            job.state = "cancelling"
+            job.revision += 1
+            self.condition.notify_all()
+        interrupt = self.interrupt(timeout_sec=timeout_sec)
+        with self.condition:
+            if not job.terminal or job.state == "timed_out":
+                self._finish_job(job, "cancelled")
+            self.condition.notify_all()
+            return {
+                "already_terminal": False,
+                "interrupt": interrupt,
+                "job": job.snapshot(),
+            }
+
+    # -- inferior topology and target capabilities ----------------------
+
+    def inferiors(self, *, refresh: bool = True) -> dict[str, Any]:
+        if not isinstance(refresh, bool):
+            raise GdbMcpError("refresh must be boolean", code="invalid_argument")
+        reply = None
+        if refresh:
+            reply = self.execute("-list-thread-groups --recurse 1", timeout_sec=10.0)
+            payload = reply.get("payload")
+            groups = payload.get("groups", []) if isinstance(payload, dict) else []
+            with self.condition:
+                for group in groups:
+                    if not isinstance(group, dict):
+                        continue
+                    group_id = str(group.get("id") or "")
+                    if not group_id:
+                        continue
+                    inferior = self._ensure_inferior(group_id)
+                    raw_pid = group.get("pid")
+                    try:
+                        inferior.pid = (
+                            int(raw_pid) if raw_pid is not None else inferior.pid
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    executable = group.get("executable")
+                    if executable:
+                        inferior.executable = str(executable)
+                    threads = group.get("threads")
+                    if isinstance(threads, list):
+                        previous_threads = set(inferior.threads)
+                        current_threads: set[str] = set()
+                        thread_states: set[str] = set()
+                        for thread in threads:
+                            if not isinstance(thread, dict) or thread.get("id") is None:
+                                continue
+                            thread_id = str(thread["id"])
+                            current_threads.add(thread_id)
+                            self._thread_to_group[thread_id] = group_id
+                            if thread.get("state") is not None:
+                                thread_states.add(str(thread["state"]))
+                        inferior.threads = current_threads
+                        for thread_id in previous_threads - current_threads:
+                            self._thread_to_group.pop(thread_id, None)
+                        if "running" in thread_states:
+                            inferior.state = "running"
+                        elif thread_states:
+                            inferior.state = "stopped"
+                    exit_code = group.get("exit-code")
+                    if exit_code is not None:
+                        inferior.exit_code = str(exit_code)
+                        inferior.state = "exited"
+                    elif inferior.state == "added" and inferior.pid is not None:
+                        inferior.state = (
+                            "stopped" if self.run_state == "stopped" else "started"
+                        )
+
+                current_thread = (
+                    str(payload.get("current-thread-id"))
+                    if isinstance(payload, dict)
+                    and payload.get("current-thread-id") is not None
+                    else None
+                )
+                current_group = self._thread_to_group.get(current_thread or "")
+                if current_group:
+                    inferior = self._ensure_inferior(current_group)
+                    self.thread_group = current_group
+                    self.selected_inferior = inferior.inferior_id
+                    self.pid = inferior.pid
+                    try:
+                        self.selected_thread = (
+                            int(current_thread) if current_thread else None
+                        )
+                    except ValueError:
+                        self.selected_thread = None
+        with self.condition:
+            items = [item.snapshot() for item in self._inferiors.values()]
+            return {
+                "inferiors": items,
+                "count": len(items),
+                "active_count": len(self._active_inferiors()),
+                "selected_inferior": self.selected_inferior,
+                "selected_group": self.thread_group,
+                "refresh_reply": reply,
+            }
+
+    def select_inferior(self, inferior_id: int) -> dict[str, Any]:
+        if isinstance(inferior_id, bool) or inferior_id < 1:
+            raise GdbMcpError("inferior_id must be positive", code="invalid_argument")
+        reply = self.execute(f"inferior {inferior_id}", timeout_sec=10.0)
+        group_id = f"i{inferior_id}"
+        with self.condition:
+            inferior = self._ensure_inferior(group_id)
+            self.selected_inferior = inferior_id
+            self.thread_group = group_id
+            self.pid = inferior.pid
+            self.selected_thread = None
+            self.selected_frame = 0
+        return {"selected_inferior": inferior_id, "group_id": group_id, "reply": reply}
+
+    def set_fork_policy(
+        self,
+        *,
+        follow: str,
+        detach_on_fork: bool,
+        schedule_multiple: bool,
+    ) -> dict[str, Any]:
+        if follow not in {"parent", "child"}:
+            raise GdbMcpError("follow must be parent or child", code="invalid_argument")
+        if not isinstance(detach_on_fork, bool) or not isinstance(
+            schedule_multiple, bool
+        ):
+            raise GdbMcpError(
+                "detach_on_fork and schedule_multiple must be boolean",
+                code="invalid_argument",
+            )
+        with self.command_lock:
+            return self._set_fork_policy_locked(
+                follow=follow,
+                detach_on_fork=detach_on_fork,
+                schedule_multiple=schedule_multiple,
+            )
+
+    def _set_fork_policy_locked(
+        self,
+        *,
+        follow: str,
+        detach_on_fork: bool,
+        schedule_multiple: bool,
+    ) -> dict[str, Any]:
+        requested = {
+            "follow": follow,
+            "detach_on_fork": detach_on_fork,
+            "schedule_multiple": schedule_multiple,
+        }
+        previous = dict(self.fork_policy)
+        settings = [
+            ("follow", "follow-fork-mode", follow),
+            ("detach_on_fork", "detach-on-fork", "on" if detach_on_fork else "off"),
+            (
+                "schedule_multiple",
+                "schedule-multiple",
+                "on" if schedule_multiple else "off",
+            ),
+        ]
+        replies: list[CommandReply] = []
+        applied: list[tuple[str, str]] = []
+        try:
+            for key, setting, value in settings:
+                replies.append(
+                    self.execute(f"-gdb-set {setting} {value}", timeout_sec=5.0)
+                )
+                applied.append((key, setting))
+        except GdbMcpError as exc:
+            rollback_errors: list[str] = []
+            for key, setting in reversed(applied):
+                old = previous[key]
+                old_value = old if key == "follow" else "on" if old else "off"
+                try:
+                    self.execute(f"-gdb-set {setting} {old_value}", timeout_sec=5.0)
+                except GdbMcpError as rollback_exc:
+                    rollback_errors.append(f"{setting}: {rollback_exc.message}")
+            raise GdbMcpError(
+                exc.message,
+                code=exc.code,
+                retryable=exc.retryable,
+                details={
+                    **exc.details,
+                    "requested_policy": requested,
+                    "previous_policy": previous,
+                    "applied_before_failure": [key for key, _ in applied],
+                    "rollback_errors": rollback_errors,
+                },
+                recovery=exc.recovery,
+            ) from exc
+        self.fork_policy = requested
+        return {"policy": dict(self.fork_policy), "replies": replies}
+
+    def capabilities(self, *, refresh: bool = False) -> dict[str, Any]:
+        if not isinstance(refresh, bool):
+            raise GdbMcpError("refresh must be boolean", code="invalid_argument")
+        with self.command_lock:
+            return self._capabilities_locked(refresh=refresh)
+
+    def _capabilities_locked(self, *, refresh: bool) -> dict[str, Any]:
+        with self.condition:
+            if self._capabilities is not None and not refresh:
+                return {**bounded_value(self._capabilities), "cached": True}
+            if self.run_state == "running":
+                raise GdbMcpError(
+                    "capability refresh is unavailable while the target is running",
+                    code="invalid_state",
+                    details={"run_state": self.run_state},
+                    recovery=["Use the cached manifest or interrupt the inferior."],
+                )
+
+        errors: dict[str, str] = {}
+
+        def query(name: str, command: str) -> CommandReply | None:
+            try:
+                return self.execute(command, timeout_sec=10.0)
+            except GdbMcpError as exc:
+                errors[name] = f"{exc.code}: {exc.message}"
+                return None
+
+        features_reply = query("mi_features", "-list-features")
+        target_reply = query("target_features", "-list-target-features")
+        osabi_reply = query("osabi", "show osabi")
+        non_stop_reply = query("non_stop", "show non-stop")
+        mi_commands: dict[str, bool] = {}
+        for command in (
+            "data-read-memory-bytes",
+            "exec-reverse-continue",
+            "exec-reverse-next",
+            "list-thread-groups",
+            "var-update",
+        ):
+            reply = query(
+                f"mi_command:{command}", f"-info-gdb-mi-command {mi_quote(command)}"
+            )
+            payload = reply.get("payload") if reply else None
+            info = payload.get("command") if isinstance(payload, dict) else None
+            exists = info.get("exists") if isinstance(info, dict) else None
+            mi_commands[command] = str(exists).lower() == "true"
+
+        def payload_list(reply: CommandReply | None, key: str) -> list[str]:
+            payload = reply.get("payload") if reply else None
+            values = payload.get(key, []) if isinstance(payload, dict) else []
+            return (
+                sorted(str(value) for value in values)
+                if isinstance(values, list)
+                else []
+            )
+
+        osabi_output = osabi_reply["output"] if osabi_reply else ""
+        osabi_matches = re.findall(r'"([^"]+)"', osabi_output)
+        non_stop_output = non_stop_reply["output"].lower() if non_stop_reply else ""
+        discovered_at = time.time()
+        result = {
+            "revision": "pygdbmi.capabilities/1",
+            "discovered_at": discovered_at,
+            "gdb_version": self.gdb_version,
+            "architecture": self.architecture,
+            "endianness": self.endianness,
+            "pointer_width": self.pointer_width,
+            "osabi": osabi_matches[-1] if osabi_matches else None,
+            "osabi_setting": osabi_matches[0] if osabi_matches else None,
+            "mi_features": payload_list(features_reply, "features"),
+            "target_features": payload_list(target_reply, "features"),
+            "mi_commands": mi_commands,
+            "non_stop": "is on" in non_stop_output,
+            "inferior_tty": self.inferior_tty_path is not None,
+            "async_events": True,
+            "errors": errors,
+        }
+        with self.condition:
+            self._capabilities = bounded_value(result)
+            self._capabilities_at = discovered_at
+            return {**bounded_value(result), "cached": False}
+
+    def invalidate_capabilities(self) -> None:
+        with self.condition:
+            self._capabilities = None
+            self._capabilities_at = None
 
     def _store_output(self, command_id: int, output: str) -> None:
         self._outputs[command_id] = output[:MAX_COMMAND_OUTPUT]
@@ -849,6 +1630,7 @@ class GdbSession:
 
     def refresh_target_traits(self) -> None:
         """Best-effort cached target traits; failure never invalidates a load."""
+        self.invalidate_capabilities()
         try:
             output = self.execute("show architecture", timeout_sec=5.0)["output"]
             match = re.search(r"currently\s+([^.)]+)", output, re.IGNORECASE)

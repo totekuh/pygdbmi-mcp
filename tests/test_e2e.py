@@ -17,6 +17,7 @@ from pygdbmi_mcp.server import (
     gdb_backtrace,
     gdb_batch,
     gdb_breakpoint,
+    gdb_capabilities,
     gdb_cast_print,
     gdb_catchpoint,
     gdb_command,
@@ -26,9 +27,15 @@ from pygdbmi_mcp.server import (
     gdb_disassemble,
     gdb_enable_breakpoint,
     gdb_events,
+    gdb_execution_cancel,
+    gdb_execution_list,
+    gdb_execution_start,
+    gdb_execution_status,
     gdb_finish,
+    gdb_fork_policy,
     gdb_inferior_io,
     gdb_inferior_stdin,
+    gdb_inferiors,
     gdb_info_files,
     gdb_info_functions,
     gdb_info_proc_mappings,
@@ -56,6 +63,7 @@ from pygdbmi_mcp.server import (
     gdb_remote_disconnect,
     gdb_run,
     gdb_select_frame,
+    gdb_select_inferior,
     gdb_select_thread,
     gdb_session_status,
     gdb_set,
@@ -139,7 +147,7 @@ class TestSessionAndErrors:
     def test_start_list_status_and_stop(self):
         started = ok(gdb_start())
         sid = started["session_id"]
-        assert started["catalog"]["tool_count"] == 65
+        assert started["catalog"]["tool_count"] == 73
         listing = ok(gdb_list_sessions())
         assert sid in {item["session_id"] for item in listing["sessions"]}
         current = status(sid)
@@ -242,6 +250,176 @@ class TestBreakpointsAndExecution:
 
 
 class TestControlPlane:
+    def test_retained_execution_stop_status_list_and_terminal_cancel(self, session):
+        ok(gdb_breakpoint(session, "main"))
+        started = ok(gdb_execution_start(session, "run", timeout_sec=5))
+        if started["state"] == "running":
+            completed = ok(
+                gdb_execution_status(
+                    session,
+                    started["job_id"],
+                    after_revision=started["revision"],
+                    wait_timeout=8,
+                )
+            )
+        else:
+            completed = started
+        assert completed["state"] == "stopped"
+        assert completed["stop_id"] > completed["baseline_stop_id"]
+        listed = ok(gdb_execution_list(session))
+        assert listed["count"] == 1
+        assert listed["jobs"][0]["job_id"] == started["job_id"]
+        cancelled = ok(gdb_execution_cancel(session, started["job_id"]))
+        assert cancelled["already_terminal"] is True
+        assert cancelled["job"]["state"] == "stopped"
+
+    def test_execution_timeout_cancel_and_cached_capabilities_while_running(
+        self, binary_path
+    ):
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path, args=["loop"]))
+            discovered = ok(gdb_capabilities(sid))
+            assert discovered["cached"] is False
+            cached = ok(gdb_capabilities(sid))
+            assert cached["cached"] is True
+            assert cached["discovered_at"] == discovered["discovered_at"]
+
+            started = ok(gdb_execution_start(sid, "run", timeout_sec=0.05))
+            timed_out = ok(
+                gdb_execution_status(
+                    sid,
+                    started["job_id"],
+                    after_revision=started["revision"],
+                    wait_timeout=2,
+                )
+            )
+            assert timed_out["state"] == "timed_out"
+            assert status(sid)["run_state"] == "running"
+            assert ok(gdb_capabilities(sid))["cached"] is True
+            failed(gdb_capabilities(sid, refresh=True), "invalid_state")
+
+            cancelled = ok(gdb_execution_cancel(sid, started["job_id"]))
+            assert cancelled["job"]["state"] == "cancelled"
+            assert status(sid)["run_state"] == "stopped"
+            refreshed = ok(gdb_capabilities(sid, refresh=True))
+            assert refreshed["cached"] is False
+            assert refreshed["discovered_at"] >= discovered["discovered_at"]
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+
+    def test_inferior_topology_selection_and_edges(self, session, binary_path):
+        initial = ok(gdb_inferiors(session))
+        assert initial["active_count"] == 0
+        ok(gdb_command(session, f"add-inferior -exec {binary_path}"))
+        topology = ok(gdb_inferiors(session))
+        assert {item["inferior_id"] for item in topology["inferiors"]} >= {1, 2}
+        assert topology["active_count"] == 0
+        selected = ok(gdb_select_inferior(session, 2))
+        assert selected["selected_inferior"] == 2
+        assert status(session)["selected_inferior"] == 2
+        ok(gdb_select_inferior(session, 1))
+        failed(gdb_select_inferior(session, 999), "gdb_error")
+        failed(
+            gdb_fork_policy(session, follow="the-void"),  # type: ignore[arg-type]
+            "invalid_argument",
+        )
+
+    def test_fork_policy_tracks_child_exit_without_losing_parent(self, binary_path):
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path, args=["fork"]))
+            policy = ok(
+                gdb_fork_policy(
+                    sid,
+                    follow="parent",
+                    detach_on_fork=False,
+                    schedule_multiple=True,
+                )
+            )
+            assert policy["policy"] == {
+                "follow": "parent",
+                "detach_on_fork": False,
+                "schedule_multiple": True,
+            }
+            started = ok(gdb_execution_start(sid, "run", timeout_sec=5))
+            completed = (
+                ok(
+                    gdb_execution_status(
+                        sid,
+                        started["job_id"],
+                        after_revision=started["revision"],
+                        wait_timeout=8,
+                    )
+                )
+                if started["state"] == "running"
+                else started
+            )
+            assert completed["state"] in {"stopped", "exited"}
+            topology = ok(gdb_inferiors(sid))
+            assert topology["count"] >= 2
+            assert any(item["state"] == "exited" for item in topology["inferiors"])
+            active = [
+                item
+                for item in topology["inferiors"]
+                if item["state"] in {"started", "running", "stopped"}
+            ]
+            if active:
+                ok(gdb_select_inferior(sid, active[0]["inferior_id"]))
+                resumed = ok(gdb_execution_start(sid, "continue", timeout_sec=5))
+                if resumed["state"] == "running":
+                    resumed = ok(
+                        gdb_execution_status(
+                            sid,
+                            resumed["job_id"],
+                            after_revision=resumed["revision"],
+                            wait_timeout=8,
+                        )
+                    )
+                assert resumed["state"] in {"stopped", "exited"}
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+
+    def test_exec_stop_is_attributed_to_the_same_inferior(self, binary_path):
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path, args=["exec"]))
+            ok(gdb_catchpoint(sid, "exec"))
+            started = ok(gdb_execution_start(sid, "run", timeout_sec=5))
+            completed = (
+                ok(
+                    gdb_execution_status(
+                        sid,
+                        started["job_id"],
+                        after_revision=started["revision"],
+                        wait_timeout=8,
+                    )
+                )
+                if started["state"] == "running"
+                else started
+            )
+            assert completed["state"] == "stopped"
+            current = status(sid)
+            assert current["last_stop"]["reason"] == "exec"
+            topology = ok(gdb_inferiors(sid))
+            selected = next(
+                item
+                for item in topology["inferiors"]
+                if item["inferior_id"] == topology["selected_inferior"]
+            )
+            assert selected["exec_count"] == 1
+            assert selected["pid"] == current["pid"]
+            events = ok(gdb_events(sid, after_cursor=0, limit=500))
+            assert any(
+                item["record"].get("payload", {}).get("reason") == "exec"
+                for item in events["events"]
+            )
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+
     def test_events_wait_and_compact_context_ab(self, session):
         stopped = break_and_run(session, "add")
         compact = ok(

@@ -6,7 +6,7 @@ from typing import Any, Literal, TypedDict
 
 MCP_SCHEMA = "pygdbmi.mcp/1"
 ERROR_SCHEMA = "pygdbmi.error/1"
-CATALOG_REVISION = "2026-09-01.mcp-stability.1"
+CATALOG_REVISION = "2026-09-01.execution-topology.1"
 
 
 class SessionSummary(TypedDict, total=False):
@@ -31,6 +31,13 @@ class SessionSummary(TypedDict, total=False):
     inferior_tty: str | None
     inferior_io_cursor: int
     inferior_io_base_cursor: int
+    selected_inferior: int | None
+    inferior_count: int
+    active_inferior_count: int
+    inferiors: list[dict[str, Any]]
+    fork_policy: dict[str, Any]
+    active_execution_jobs: list[str]
+    capabilities_cached_at: float | None
 
 
 class ErrorInfo(TypedDict):

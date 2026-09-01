@@ -23,7 +23,7 @@ def test_stdio_protocol_catalog_envelopes_and_lifespan_cleanup() -> None:
                 initialized = await session.initialize()
                 assert "gdb_wait_for_stop" in initialized.instructions
                 catalog = await session.list_tools()
-                assert len(catalog.tools) == 65
+                assert len(catalog.tools) == 73
                 context = next(
                     tool for tool in catalog.tools if tool.name == "gdb_context"
                 )
@@ -38,6 +38,15 @@ def test_stdio_protocol_catalog_envelopes_and_lifespan_cleanup() -> None:
                 assert started.structuredContent["schema"] == "pygdbmi.mcp/1"
                 assert started.structuredContent["ok"] is True
                 session_id = started.structuredContent["result"]["session_id"]
+
+                capabilities = await session.call_tool(
+                    "gdb_capabilities", {"session_id": session_id}
+                )
+                assert capabilities.isError is False
+                assert capabilities.structuredContent["ok"] is True
+                assert capabilities.structuredContent["result"]["revision"] == (
+                    "pygdbmi.capabilities/1"
+                )
 
                 logical_error = await session.call_tool(
                     "gdb_command",

@@ -124,8 +124,8 @@ def _tools():
 
 def test_catalog_identity_count_and_shared_structured_output() -> None:
     tools = _tools()
-    assert len(tools) == 65
-    assert CATALOG_REVISION == "2026-09-01.mcp-stability.1"
+    assert len(tools) == 73
+    assert CATALOG_REVISION == "2026-09-01.execution-topology.1"
     assert len({tool.name for tool in tools}) == len(tools)
     assert all(
         tool.outputSchema and tool.outputSchema["type"] == "object" for tool in tools
@@ -146,6 +146,23 @@ def test_catalog_exposes_constraints_and_literal_enums() -> None:
     assert memory["word_size"]["enum"] == [1, 2, 4, 8]
     stop = tools["gdb_stop"].inputSchema["properties"]
     assert stop["policy"]["enum"] == ["auto", "kill", "detach", "disconnect", "quit"]
+    execution = tools["gdb_execution_start"].inputSchema["properties"]
+    assert execution["action"]["enum"] == [
+        "run",
+        "continue",
+        "step",
+        "next",
+        "finish",
+        "until",
+    ]
+    assert execution["timeout_sec"]["minimum"] == 0
+    assert execution["timeout_sec"]["maximum"] == 86400
+    job_status = tools["gdb_execution_status"].inputSchema["properties"]
+    assert job_status["wait_timeout"]["maximum"] == 300
+    cancellation = tools["gdb_execution_cancel"].inputSchema["properties"]
+    assert cancellation["timeout_sec"]["minimum"] == 0.05
+    fork_policy = tools["gdb_fork_policy"].inputSchema["properties"]
+    assert fork_policy["follow"]["enum"] == ["parent", "child"]
 
 
 @pytest.mark.parametrize(
@@ -156,6 +173,12 @@ def test_catalog_exposes_constraints_and_literal_enums() -> None:
         ("gdb_memory_write", False, True, False, False),
         ("gdb_start", False, True, False, True),
         ("gdb_command", False, True, False, True),
+        ("gdb_execution_start", False, True, False, False),
+        ("gdb_execution_status", True, False, True, False),
+        ("gdb_execution_cancel", False, True, True, False),
+        ("gdb_inferiors", True, False, True, False),
+        ("gdb_fork_policy", False, True, True, False),
+        ("gdb_capabilities", True, False, True, False),
     ],
 )
 def test_tool_annotations(
@@ -173,4 +196,8 @@ def test_server_instructions_define_efficient_workflow() -> None:
     assert "gdb_wait_for_stop" in instructions
     assert "gdb_context" in instructions
     assert "gdb_output_page" in instructions
+    assert "gdb_execution_start" in instructions
+    assert "gdb_execution_status" in instructions
+    assert "gdb_capabilities" in instructions
+    assert "gdb_inferiors" in instructions
     assert "check ok" in instructions
