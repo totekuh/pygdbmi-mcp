@@ -1,5 +1,6 @@
-import subprocess
 import os
+import subprocess
+
 import pytest
 
 TESTS_DIR = os.path.dirname(__file__)
@@ -10,9 +11,7 @@ TEST_BINARY = os.path.join(TESTS_DIR, "test_binary")
 @pytest.fixture(scope="session", autouse=True)
 def compile_test_binary():
     """Compile the test C binary with debug symbols."""
-    subprocess.check_call(
-        ["gcc", "-g", "-O0", "-o", TEST_BINARY, TEST_BINARY_SRC]
-    )
+    subprocess.check_call(["gcc", "-g", "-O0", "-o", TEST_BINARY, TEST_BINARY_SRC])
     yield
     if os.path.exists(TEST_BINARY):
         os.remove(TEST_BINARY)

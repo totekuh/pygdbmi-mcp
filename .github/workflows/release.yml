@@ -87,7 +87,7 @@ jobs:
           {
             echo "# pygdbmi-mcp ${TAG}"
             echo
-            echo "MCP server exposing GDB debugging via pygdbmi — **52 tools** covering session management, execution control, breakpoints/watchpoints/catchpoints, memory read/write/search, disassembly, source listing, type/struct inspection, symbol lookup, remote debugging, and GDB settings."
+            echo "MCP server exposing GDB debugging via pygdbmi — **65 tools** backed by a persistent token-correlated MI dispatcher, versioned results, state gating, cursor-paged events/output and inferior PTY I/O, atomic context/batches, variable objects, and full local/attach/remote/core workflows."
             echo
             echo "## Install"
             echo

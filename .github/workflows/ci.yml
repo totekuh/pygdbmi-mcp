@@ -29,10 +29,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install system dependencies (gdb, gcc)
+      - name: Install system dependencies (gdb, gdbserver, gcc)
         run: |
           sudo apt-get update
-          sudo apt-get install -y gdb gcc
+          sudo apt-get install -y gdb gdbserver gcc
 
       - name: Install package (with dev extras)
         run: |
