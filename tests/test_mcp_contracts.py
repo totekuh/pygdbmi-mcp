@@ -19,6 +19,7 @@ from pygdbmi_mcp.server import (
     gdb_batch,
     gdb_command,
     gdb_context,
+    gdb_load_core,
     gdb_memory,
     gdb_var_children,
     manager,
@@ -33,6 +34,34 @@ class StateStub:
 
     def status(self) -> dict:
         return {"session_id": "state-stub", "run_state": self.run_state, "stop_id": 4}
+
+
+class CoreLoadStub(StateStub):
+    def __init__(self, *, old_parser: bool, unrelated_error: bool = False) -> None:
+        super().__init__("idle")
+        self.old_parser = old_parser
+        self.unrelated_error = unrelated_error
+        self.commands: list[str] = []
+        self.binary = None
+        self.target_kind = "none"
+
+    def execute(self, command: str, *, timeout_sec: float) -> dict:
+        self.commands.append(command)
+        if command.startswith('core-file "'):
+            if self.unrelated_error:
+                raise GdbMcpError("Permission denied", code="gdb_error")
+            if self.old_parser:
+                path = command.removeprefix("core-file ")
+                raise GdbMcpError(
+                    f"{path}: No such file or directory", code="gdb_error"
+                )
+        return {"result_class": "done", "payload": {}, "output": ""}
+
+    def set_state(self, state: str, *, clear_stop: bool = False) -> None:
+        self.run_state = state
+
+    def refresh_target_traits(self) -> None:
+        return None
 
 
 def test_success_envelope_has_stable_shape() -> None:
@@ -116,6 +145,40 @@ def test_direct_tool_bounds_fail_before_reaching_gdb() -> None:
     finally:
         manager.sessions.pop("state-stub")
     assert all(item["error"]["code"] == "invalid_argument" for item in failed_calls)
+
+
+@pytest.mark.parametrize("old_parser", [False, True])
+def test_core_load_path_quoting_ab_across_gdb_generations(tmp_path, old_parser) -> None:
+    stub = CoreLoadStub(old_parser=old_parser)
+    manager.sessions["state-stub"] = stub  # type: ignore[assignment]
+    core = str(tmp_path / "crash core with spaces")
+    binary = str(tmp_path / "test binary")
+    try:
+        envelope = gdb_load_core("state-stub", core, binary)
+    finally:
+        manager.sessions.pop("state-stub")
+    assert envelope["ok"] is True
+    core_commands = [
+        command for command in stub.commands if command.startswith("core-file")
+    ]
+    assert core_commands[0] == f'core-file "{core}"'
+    assert core_commands == (
+        [f'core-file "{core}"', f"core-file {core}"]
+        if old_parser
+        else [f'core-file "{core}"']
+    )
+
+
+def test_core_load_does_not_retry_unrelated_failure(tmp_path) -> None:
+    stub = CoreLoadStub(old_parser=False, unrelated_error=True)
+    manager.sessions["state-stub"] = stub  # type: ignore[assignment]
+    try:
+        envelope = gdb_load_core("state-stub", str(tmp_path / "crash core with spaces"))
+    finally:
+        manager.sessions.pop("state-stub")
+    assert envelope["ok"] is False
+    assert envelope["error"]["message"] == "Permission denied"
+    assert len([item for item in stub.commands if item.startswith("core-file")]) == 1
 
 
 def _tools():
