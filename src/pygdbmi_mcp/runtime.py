@@ -14,6 +14,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
 import threading
 import time
@@ -44,6 +45,9 @@ JobState = Literal[
     "cancelled",
     "timed_out",
     "failed",
+    "collecting",
+    "crashed",
+    "unexpected_stop",
 ]
 
 MAX_EVENTS = 1024
@@ -56,6 +60,17 @@ MAX_NOTIFICATIONS = 128
 MAX_INFERIOR_IO = 1024 * 1024
 MAX_INFERIOR_WRITE = 64 * 1024
 MAX_EXECUTION_JOBS = 32
+MAX_LOG_BREAKPOINTS = 64
+MAX_LOG_HITS = 1024
+
+_GENERAL_REGISTER_NAMES = {
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip", "eflags",
+    "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags",
+    "pc", "sp", "fp", "lr", "cpsr", "xpsr", "ra", "gp", "tp", "hi", "lo",
+    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2",
+    "t3", "t4", "t5", "t6", "t7", "t8", "t9", "s0", "s1", "s2", "s3",
+    "s4", "s5", "s6", "s7", "s8", "status", "cause", "badvaddr",
+} | {f"r{index}" for index in range(32)} | {f"x{index}" for index in range(31)}
 
 
 def mi_quote(value: object) -> str:
@@ -101,12 +116,15 @@ class _PendingCommand:
     token: int
     command: str
     started: float
+    event_cursor_start: int = 0
     result: dict[str, Any] | None = None
     error: BaseException | None = None
     console: list[str] = field(default_factory=list)
     target: list[str] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
     notifications: list[dict[str, Any]] = field(default_factory=list)
+    notification_count: int = 0
+    notification_summary: dict[str, int] = field(default_factory=dict)
     output_chars: int = 0
     output_truncated: bool = False
     done: threading.Event = field(default_factory=threading.Event)
@@ -123,6 +141,9 @@ class _PendingCommand:
         getattr(self, record_type).append(kept)
 
     def add_notification(self, record: dict[str, Any]) -> None:
+        self.notification_count += 1
+        key = f"{record.get('type', 'unknown')}:{record.get('message') or 'unknown'}"
+        self.notification_summary[key] = self.notification_summary.get(key, 0) + 1
         if len(self.notifications) < MAX_NOTIFICATIONS:
             self.notifications.append(
                 bounded_value(record, max_string=MAX_EVENT_STRING, max_items=256)
@@ -176,6 +197,12 @@ class _ExecutionJob:
     stop_id: int | None = None
     end_io_cursor: int | None = None
     cancel_requested: bool = False
+    kind: str = "execution"
+    stop_signals: tuple[str, ...] = ()
+    collect: tuple[str, ...] = ()
+    evidence: dict[str, Any] | None = None
+    restore_signal_commands: tuple[str, ...] = ()
+    signal_policy_restored: bool = True
 
     @property
     def terminal(self) -> bool:
@@ -185,6 +212,8 @@ class _ExecutionJob:
             "cancelled",
             "timed_out",
             "failed",
+            "crashed",
+            "unexpected_stop",
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -204,6 +233,50 @@ class _ExecutionJob:
             "command_reply": bounded_value(self.command_reply),
             "error": bounded_value(self.error),
             "cancel_requested": self.cancel_requested,
+            "kind": self.kind,
+            "stop_signals": list(self.stop_signals),
+            "collect": list(self.collect),
+            "evidence": bounded_value(self.evidence),
+            "signal_policy_restored": self.signal_policy_restored,
+        }
+
+
+@dataclass
+class _LogBreakpoint:
+    log_id: str
+    breakpoint_number: str
+    location: str
+    expressions: tuple[str, ...]
+    condition: str
+    hit_limit: int
+    backtrace_depth: int
+    addresses: tuple[int, ...] = ()
+    created_at: float = field(default_factory=time.time)
+    enabled: bool = True
+    hit_count: int = 0
+    cursor: int = 0
+    hits: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=MAX_LOG_HITS)
+    )
+    last_error: dict[str, Any] | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "log_id": self.log_id,
+            "breakpoint_number": self.breakpoint_number,
+            "location": self.location,
+            "expressions": list(self.expressions),
+            "condition": self.condition,
+            "limit": self.hit_limit,
+            "backtrace_depth": self.backtrace_depth,
+            "addresses": [hex(address) for address in self.addresses],
+            "enabled": self.enabled,
+            "hit_count": self.hit_count,
+            "cursor": self.cursor,
+            "retained_hits": len(self.hits),
+            "retention_limit": MAX_LOG_HITS,
+            "created_at": self.created_at,
+            "last_error": bounded_value(self.last_error),
         }
 
 
@@ -217,6 +290,36 @@ def _numeric_sort_key(value: str) -> tuple[int, str]:
 def _inferior_number(group_id: str) -> int | None:
     match = re.fullmatch(r"i(\d+)", group_id)
     return int(match.group(1)) if match else None
+
+
+def _breakpoint_rows(reply: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = reply.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    breakpoint = payload.get("bkpt")
+    if isinstance(breakpoint, dict):
+        return [breakpoint]
+    table = payload.get("BreakpointTable")
+    body = table.get("body") if isinstance(table, dict) else None
+    return [item for item in body or [] if isinstance(item, dict)]
+
+
+def _breakpoint_addresses(breakpoint: dict[str, Any]) -> set[int]:
+    addresses: set[int] = set()
+    candidates = [breakpoint]
+    locations = breakpoint.get("locations")
+    if isinstance(locations, list):
+        candidates.extend(item for item in locations if isinstance(item, dict))
+    for item in candidates:
+        raw = item.get("addr")
+        if isinstance(raw, str) and re.fullmatch(r"0x[0-9a-fA-F]+", raw):
+            addresses.add(int(raw, 16))
+    return addresses
+
+
+def _breakpoint_location(breakpoint: dict[str, Any]) -> str | None:
+    value = breakpoint.get("original-location")
+    return value.strip() if isinstance(value, str) else None
 
 
 class GdbSession:
@@ -236,6 +339,10 @@ class GdbSession:
         self.gdb_path = gdb_path
         self.inferior_args = list(inferior_args or [])
         self.binary: str | None = None
+        self.sysroot: str | None = None
+        self.debug_directories: list[str] = ["/usr/lib/debug"]
+        self.source_substitutions: list[dict[str, str]] = []
+        self.debuginfod_enabled = False
         self.pid: int | None = None
         self.target_kind: TargetKind = "none"
         self.run_state: RunState = "idle"
@@ -274,8 +381,16 @@ class GdbSession:
         self._thread_to_group: dict[str, str] = {}
         self._execution_jobs: OrderedDict[str, _ExecutionJob] = OrderedDict()
         self._next_job_id = 0
+        self._log_breakpoints: OrderedDict[str, _LogBreakpoint] = OrderedDict()
+        self._breakpoint_logs: dict[str, str] = {}
+        self._next_log_id = 0
+        self._log_actions: deque[tuple[str, dict[str, Any]]] = deque()
+        self._action_active: str | None = None
+        self._interrupt_after_action = False
         self._capabilities: dict[str, Any] | None = None
         self._capabilities_at: float | None = None
+        self._temporary_directories: list[str] = []
+        self._adapter_processes: list[Any] = []
         self._closing = threading.Event()
         self._reader_error: BaseException | None = None
         self._pty_master: int | None = None
@@ -289,7 +404,13 @@ class GdbSession:
             name=f"pygdbmi-reader-{session_id}",
             daemon=True,
         )
+        self._action_worker = threading.Thread(
+            target=self._log_action_main,
+            name=f"pygdbmi-actions-{session_id}",
+            daemon=True,
+        )
         self._reader.start()
+        self._action_worker.start()
 
     # -- lifecycle -------------------------------------------------------
 
@@ -340,8 +461,22 @@ class GdbSession:
             cleanup.setdefault("errors", []).append(f"exit: {exc}")
         self._close_inferior_tty()
         self._reader.join(timeout=2.0)
+        self._action_worker.join(timeout=2.0)
         if self._io_reader is not None:
             self._io_reader.join(timeout=2.0)
+        for directory in self._temporary_directories:
+            shutil.rmtree(directory, ignore_errors=True)
+        self._temporary_directories.clear()
+        for process in self._adapter_processes:
+            try:
+                process.terminate()
+                process.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001 - external adapter teardown is best effort
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        self._adapter_processes.clear()
         with self.condition:
             for pending in self._pending.values():
                 pending.error = RuntimeError("session closed")
@@ -489,7 +624,9 @@ class GdbSession:
             with self.condition:
                 self._next_token += 1
                 token = self._next_token
-                pending = _PendingCommand(token, command, time.monotonic())
+                pending = _PendingCommand(
+                    token, command, time.monotonic(), self._event_cursor
+                )
                 self._pending[token] = pending
                 self._active_pending = pending
                 self.last_command = command
@@ -558,6 +695,10 @@ class GdbSession:
                 "truncated": pending.output_truncated
                 or len(output) > int(output_page_chars),
                 "notifications": pending.notifications,
+                "notification_count": pending.notification_count,
+                "notification_summary": dict(pending.notification_summary),
+                "event_cursor_start": pending.event_cursor_start,
+                "event_cursor_end": self._event_cursor,
                 "elapsed_ms": round((time.monotonic() - pending.started) * 1000, 3),
             }
             if result_class == "error":
@@ -640,16 +781,198 @@ class GdbSession:
                         self.last_stop = None
                     owner.done.set()
 
+            managed_log_id = self._managed_log_id(record_type, message, payload)
             if record_type in {"exec", "notify", "status", "target", "log"}:
                 self._event_cursor += 1
-                self._events.append(
-                    {
-                        "cursor": self._event_cursor,
-                        "received_at": time.time(),
-                        "record": record,
+                event = {
+                    "cursor": self._event_cursor,
+                    "received_at": time.time(),
+                    "record": record,
+                }
+                if managed_log_id is not None:
+                    event["managed_action"] = {
+                        "kind": "log_breakpoint",
+                        "log_id": managed_log_id,
                     }
+                self._events.append(event)
+            if managed_log_id is not None:
+                self._log_actions.append((managed_log_id, dict(payload)))
+            else:
+                self._update_state(record_type, message, payload)
+            self.condition.notify_all()
+
+    def _managed_log_id(
+        self, record_type: Any, message: Any, payload: Any
+    ) -> str | None:
+        if record_type not in {"exec", "notify"} or message != "stopped":
+            return None
+        if not isinstance(payload, dict) or payload.get("reason") != "breakpoint-hit":
+            return None
+        number = str(payload.get("bkptno") or "")
+        if not number:
+            return None
+        log_id = self._breakpoint_logs.get(number)
+        if log_id is None and "." in number:
+            log_id = self._breakpoint_logs.get(number.split(".", 1)[0])
+        trace = self._log_breakpoints.get(log_id or "")
+        return log_id if trace is not None and trace.enabled else None
+
+    def _append_internal_event(self, message: str, payload: dict[str, Any]) -> None:
+        self._event_cursor += 1
+        self._events.append(
+            {
+                "cursor": self._event_cursor,
+                "received_at": time.time(),
+                "record": {
+                    "type": "status",
+                    "message": message,
+                    "payload": bounded_value(payload),
+                    "token": None,
+                },
+            }
+        )
+
+    def _log_action_main(self) -> None:
+        while not self._closing.is_set():
+            with self.condition:
+                while not self._log_actions and not self._closing.is_set():
+                    self.condition.wait(0.25)
+                if self._closing.is_set():
+                    return
+                log_id, stop = self._log_actions.popleft()
+                self._action_active = log_id
+            try:
+                try:
+                    self._process_log_hit(log_id, stop)
+                except Exception as exc:  # noqa: BLE001 - keep action worker alive
+                    with self.condition:
+                        trace = self._log_breakpoints.get(log_id)
+                        if trace is not None:
+                            trace.last_error = {
+                                "code": "action_worker_failed",
+                                "message": str(exc)[:2048],
+                                "exception_type": type(exc).__name__,
+                            }
+                    self._publish_failed_action_stop(stop, str(exc))
+            finally:
+                with self.condition:
+                    self._action_active = None
+                    self.condition.notify_all()
+
+    def _process_log_hit(self, log_id: str, stop: dict[str, Any]) -> None:
+        with self.command_lock:
+            with self.condition:
+                trace = self._log_breakpoints.get(log_id)
+            if trace is None or not trace.enabled:
+                self._publish_failed_action_stop(
+                    stop, "managed logging breakpoint disappeared before collection"
                 )
-            self._update_state(record_type, message, payload)
+                return
+
+            values: dict[str, Any] = {}
+            errors: dict[str, dict[str, str]] = {}
+            for expression in trace.expressions:
+                try:
+                    reply = self.execute(
+                        f"-data-evaluate-expression {mi_quote(expression)}",
+                        timeout_sec=10.0,
+                    )
+                    payload = reply.get("payload")
+                    values[expression] = (
+                        payload.get("value") if isinstance(payload, dict) else payload
+                    )
+                except GdbMcpError as exc:
+                    values[expression] = None
+                    errors[expression] = {"code": exc.code, "message": exc.message}
+
+            backtrace: list[Any] = []
+            if trace.backtrace_depth:
+                try:
+                    reply = self.execute(
+                        f"-stack-list-frames 0 {trace.backtrace_depth - 1}",
+                        timeout_sec=15.0,
+                    )
+                    payload = reply.get("payload")
+                    if isinstance(payload, dict) and isinstance(payload.get("stack"), list):
+                        backtrace = payload["stack"][: trace.backtrace_depth]
+                except GdbMcpError as exc:
+                    errors["backtrace"] = {"code": exc.code, "message": exc.message}
+
+            frame = stop.get("frame") if isinstance(stop.get("frame"), dict) else {}
+            with self.condition:
+                current = self._log_breakpoints.get(log_id)
+                if current is None:
+                    self._publish_failed_action_stop(
+                        stop, "logging breakpoint was removed during collection"
+                    )
+                    return
+                current.hit_count += 1
+                current.cursor += 1
+                hit = {
+                    "cursor": current.cursor,
+                    "hit": current.hit_count,
+                    "stop_id": None,
+                    "address": frame.get("addr") or stop.get("address"),
+                    "thread_id": stop.get("thread-id"),
+                    "inferior": stop.get("thread-group") or stop.get("group-id"),
+                    "expressions": bounded_value(values),
+                    "backtrace": bounded_value(backtrace),
+                    "errors": bounded_value(errors),
+                    "timestamp": time.time(),
+                }
+                current.hits.append(hit)
+                reached_limit = current.hit_count >= current.hit_limit
+
+            try:
+                if reached_limit:
+                    self.execute(
+                        f"-break-disable {trace.breakpoint_number}", timeout_sec=5.0
+                    )
+                    with self.condition:
+                        trace.enabled = False
+                with self.condition:
+                    interrupt_requested = self._interrupt_after_action
+                if interrupt_requested:
+                    self._publish_interrupted_action_stop(stop, log_id)
+                    return
+                reply = self.execute("-exec-continue", timeout_sec=30.0)
+                with self.condition:
+                    self._append_internal_event(
+                        "log-breakpoint-hit",
+                        {
+                            "log_id": log_id,
+                            "hit": hit["hit"],
+                            "cursor": hit["cursor"],
+                            "auto_continued": True,
+                            "disabled": reached_limit,
+                            "command_id": reply.get("command_id"),
+                        },
+                    )
+                    self.condition.notify_all()
+            except GdbMcpError as exc:
+                with self.condition:
+                    trace.last_error = {"code": exc.code, "message": exc.message}
+                self._publish_failed_action_stop(stop, exc.message)
+
+    def _publish_failed_action_stop(self, stop: dict[str, Any], message: str) -> None:
+        with self.condition:
+            visible = {**stop, "managed-action-error": message[:2048]}
+            self._update_state("exec", "stopped", visible)
+            self._append_internal_event(
+                "log-breakpoint-error", {"stop_id": self.stop_id, "message": message}
+            )
+            self.condition.notify_all()
+
+    def _publish_interrupted_action_stop(
+        self, stop: dict[str, Any], log_id: str
+    ) -> None:
+        with self.condition:
+            visible = {**stop, "managed-action-interrupted": True}
+            self._update_state("exec", "stopped", visible)
+            self._append_internal_event(
+                "log-breakpoint-interrupted",
+                {"log_id": log_id, "stop_id": self.stop_id},
+            )
             self.condition.notify_all()
 
     def _ensure_inferior(self, group_id: str) -> _InferiorRecord:
@@ -826,6 +1149,7 @@ class GdbSession:
                 "stop_id": self.stop_id,
                 "last_stop": bounded_value(self.last_stop),
                 "binary": self.binary,
+                "sysroot": self.sysroot,
                 "pid": self.pid,
                 "target_kind": self.target_kind,
                 "selected_thread": self.selected_thread,
@@ -914,39 +1238,269 @@ class GdbSession:
                     return {"reason": "timeout", "session": self.status()}
                 self.condition.wait(remaining)
 
+    # -- managed breakpoint action traces -------------------------------
+
+    def create_log_breakpoint(
+        self,
+        location: str,
+        *,
+        expressions: list[str],
+        condition: str = "",
+        limit: int = 100,
+        backtrace_depth: int = 0,
+    ) -> dict[str, Any]:
+        if not isinstance(location, str) or not location.strip() or len(location) > 4096:
+            raise GdbMcpError(
+                "location must be a non-empty string of at most 4096 characters",
+                code="invalid_argument",
+            )
+        if any(char in location for char in "\r\n\x00"):
+            raise GdbMcpError("location must be one line", code="invalid_argument")
+        if not isinstance(expressions, list) or not 1 <= len(expressions) <= 32:
+            raise GdbMcpError(
+                "expressions must contain 1 to 32 strings", code="invalid_argument"
+            )
+        if not all(
+            isinstance(item, str)
+            and item.strip()
+            and len(item) <= 4096
+            and not any(char in item for char in "\r\n\x00")
+            for item in expressions
+        ):
+            raise GdbMcpError(
+                "each expression must be one non-empty line of at most 4096 characters",
+                code="invalid_argument",
+            )
+        if not isinstance(condition, str) or len(condition) > 4096 or any(
+            char in condition for char in "\r\n\x00"
+        ):
+            raise GdbMcpError(
+                "condition must be one line of at most 4096 characters",
+                code="invalid_argument",
+            )
+        if isinstance(limit, bool) or not 1 <= limit <= 100_000:
+            raise GdbMcpError(
+                "limit must be between 1 and 100000", code="invalid_argument"
+            )
+        if isinstance(backtrace_depth, bool) or not 0 <= backtrace_depth <= 64:
+            raise GdbMcpError(
+                "backtrace_depth must be between 0 and 64", code="invalid_argument"
+            )
+        with self.command_lock:
+            with self.condition:
+                if len(self._log_breakpoints) >= MAX_LOG_BREAKPOINTS:
+                    raise GdbMcpError(
+                        "logging breakpoint registry is full",
+                        code="log_breakpoints_full",
+                    )
+            existing = self.execute("-break-list", timeout_sec=10.0)
+            command = "-break-insert"
+            if condition:
+                command += f" -c {mi_quote(condition)}"
+            command += f" {mi_quote(location)}"
+            reply = self.execute(command, timeout_sec=10.0)
+            payload = reply.get("payload")
+            breakpoint = payload.get("bkpt") if isinstance(payload, dict) else None
+            number = breakpoint.get("number") if isinstance(breakpoint, dict) else None
+            if number is None:
+                raise GdbMcpError(
+                    "GDB created a breakpoint without returning its number",
+                    code="invalid_response",
+                    details={"reply": bounded_value(reply)},
+                )
+            addresses = _breakpoint_addresses(breakpoint)
+            conflicts = [
+                {
+                    "number": item.get("number"),
+                    "location": _breakpoint_location(item),
+                    "addresses": [hex(value) for value in _breakpoint_addresses(item)],
+                }
+                for item in _breakpoint_rows(existing)
+                if _breakpoint_location(item) == location.strip()
+                or bool(addresses.intersection(_breakpoint_addresses(item)))
+            ]
+            if conflicts:
+                cleanup_error = None
+                try:
+                    self.execute(f"-break-delete {number}", timeout_sec=5.0)
+                except GdbMcpError as exc:
+                    cleanup_error = {"code": exc.code, "message": exc.message}
+                raise GdbMcpError(
+                    "logging breakpoints cannot share an address with another breakpoint",
+                    code="breakpoint_conflict",
+                    details={
+                        "location": location,
+                        "addresses": [hex(value) for value in sorted(addresses)],
+                        "conflicts": conflicts,
+                        "cleanup_error": cleanup_error,
+                    },
+                    recovery=[
+                        "Delete the collocated breakpoint, or merge expressions into one logging breakpoint."
+                    ],
+                )
+            with self.condition:
+                self._next_log_id += 1
+                log_id = f"log-{self._next_log_id}"
+                trace = _LogBreakpoint(
+                    log_id=log_id,
+                    breakpoint_number=str(number),
+                    location=location,
+                    expressions=tuple(expressions),
+                    condition=condition,
+                    hit_limit=limit,
+                    backtrace_depth=backtrace_depth,
+                    addresses=tuple(sorted(addresses)),
+                )
+                self._log_breakpoints[log_id] = trace
+                self._breakpoint_logs[str(number)] = log_id
+                return {"log": trace.snapshot(), "breakpoint": reply}
+
+    def reject_managed_breakpoint_conflict(
+        self, reply: dict[str, Any], location: str
+    ) -> None:
+        """Remove a new ordinary breakpoint if GDB cannot distinguish it from a logger."""
+        rows = _breakpoint_rows(reply)
+        addresses = {
+            address for item in rows for address in _breakpoint_addresses(item)
+        }
+        with self.condition:
+            conflicts = [
+                trace
+                for trace in self._log_breakpoints.values()
+                if trace.location == location.strip()
+                or bool(addresses.intersection(trace.addresses))
+            ]
+        if not conflicts:
+            return
+        numbers = [str(item.get("number")) for item in rows if item.get("number")]
+        cleanup_errors: list[str] = []
+        for number in numbers:
+            try:
+                self.execute(f"-break-delete {number}", timeout_sec=5.0)
+            except GdbMcpError as exc:
+                cleanup_errors.append(f"{number}: {exc.code}: {exc.message}")
+        raise GdbMcpError(
+            "ordinary breakpoints cannot share an address with a managed logging breakpoint",
+            code="breakpoint_conflict",
+            details={
+                "location": location,
+                "addresses": [hex(value) for value in sorted(addresses)],
+                "log_ids": [trace.log_id for trace in conflicts],
+                "cleanup_errors": cleanup_errors,
+            },
+            recovery=[
+                "Delete the logging breakpoint first, or rely on its retained evidence."
+            ],
+        )
+
+    def read_log_breakpoint(
+        self, log_id: str, *, after_cursor: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
+        if isinstance(after_cursor, bool) or after_cursor < 0:
+            raise GdbMcpError(
+                "after_cursor must be non-negative", code="invalid_argument"
+            )
+        if isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise GdbMcpError(
+                "limit must be between 1 and 500", code="invalid_argument"
+            )
+        with self.condition:
+            trace = self._log_breakpoints.get(log_id)
+            if trace is None:
+                raise GdbMcpError(
+                    f"logging breakpoint {log_id!r} is not retained",
+                    code="log_not_found",
+                )
+            available = [item for item in trace.hits if item["cursor"] > after_cursor]
+            items = available[:limit]
+            oldest = trace.hits[0]["cursor"] if trace.hits else None
+            return {
+                "log": trace.snapshot(),
+                "hits": bounded_value(items),
+                "next_cursor": items[-1]["cursor"] if items else after_cursor,
+                "truncated": len(available) > len(items),
+                "cursor_gap": bool(oldest is not None and after_cursor < oldest - 1),
+                "action_active": self._action_active == log_id,
+            }
+
+    def list_log_breakpoints(self) -> dict[str, Any]:
+        with self.condition:
+            logs = [item.snapshot() for item in self._log_breakpoints.values()]
+            return {
+                "logs": logs,
+                "count": len(logs),
+                "active_count": sum(item.enabled for item in self._log_breakpoints.values()),
+                "retention_limit": MAX_LOG_BREAKPOINTS,
+                "action_active": self._action_active,
+            }
+
+    def delete_log_breakpoint(self, log_id: str) -> dict[str, Any]:
+        with self.command_lock:
+            with self.condition:
+                trace = self._log_breakpoints.get(log_id)
+                if trace is None:
+                    raise GdbMcpError(
+                        f"logging breakpoint {log_id!r} is not retained",
+                        code="log_not_found",
+                    )
+                if self._action_active == log_id or any(
+                    queued_id == log_id for queued_id, _ in self._log_actions
+                ):
+                    raise GdbMcpError(
+                        "logging breakpoint is processing a hit",
+                        code="log_action_active",
+                        retryable=True,
+                    )
+                snapshot = trace.snapshot()
+            reply = self.execute(
+                f"-break-delete {trace.breakpoint_number}", timeout_sec=5.0
+            )
+            with self.condition:
+                self._log_breakpoints.pop(log_id, None)
+                self._breakpoint_logs.pop(trace.breakpoint_number, None)
+            return {"deleted": snapshot, "breakpoint": reply}
+
     def interrupt(self, *, timeout_sec: float = 5.0) -> dict[str, Any]:
         with self.condition:
             before = self.stop_id
             if self.run_state == "stopped":
                 return {"already_stopped": True, "session": self.status()}
+            # A managed logging stop is intentionally hidden while its action
+            # worker owns the inferior.  If an interrupt races that window,
+            # make the worker publish the stop instead of auto-continuing it.
+            self._interrupt_after_action = True
         method = "mi"
         try:
-            self.execute(
-                "-exec-interrupt --all",
-                timeout_sec=max(0.05, min(timeout_sec, 2.0)),
-            )
-        except GdbMcpError:
-            # Older/non-async GDB builds can reject -exec-interrupt. SIGINT is
-            # the recovery path, not the primary control channel.
-            method = "sigint"
             try:
-                os.kill(self.controller.gdb_process.pid, signal.SIGINT)
-            except (AttributeError, OSError) as exc:
+                self.execute(
+                    "-exec-interrupt --all",
+                    timeout_sec=max(0.05, min(timeout_sec, 2.0)),
+                )
+            except GdbMcpError:
+                # Older/non-async GDB builds can reject -exec-interrupt. SIGINT is
+                # the recovery path, not the primary control channel.
+                method = "sigint"
+                try:
+                    os.kill(self.controller.gdb_process.pid, signal.SIGINT)
+                except (AttributeError, OSError) as exc:
+                    raise GdbMcpError(
+                        f"could not interrupt GDB: {exc}",
+                        code="gdb_unreachable",
+                        retryable=True,
+                    ) from exc
+            result = self.wait_for_stop(after_stop_id=before, timeout_sec=timeout_sec)
+            if result["reason"] == "timeout":
+                with self.condition:
+                    self.run_state = "indeterminate"
                 raise GdbMcpError(
-                    f"could not interrupt GDB: {exc}",
-                    code="gdb_unreachable",
+                    "interrupt requested but GDB did not publish a stop",
+                    code="interrupt_timeout",
                     retryable=True,
-                ) from exc
-        result = self.wait_for_stop(after_stop_id=before, timeout_sec=timeout_sec)
-        if result["reason"] == "timeout":
+                )
+            return {"interrupt_sent": True, "method": method, **result}
+        finally:
             with self.condition:
-                self.run_state = "indeterminate"
-            raise GdbMcpError(
-                "interrupt requested but GDB did not publish a stop",
-                code="interrupt_timeout",
-                retryable=True,
-            )
-        return {"interrupt_sent": True, "method": method, **result}
+                self._interrupt_after_action = False
 
     # -- retained execution operations ----------------------------------
 
@@ -957,6 +1511,10 @@ class GdbSession:
         instruction: bool = False,
         location: str = "",
         timeout_sec: float = 0.0,
+        kind: str = "execution",
+        stop_signals: tuple[str, ...] = (),
+        collect: tuple[str, ...] = (),
+        restore_signal_commands: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         if not isinstance(action, str):
             raise GdbMcpError("action must be a string", code="invalid_argument")
@@ -1026,6 +1584,11 @@ class GdbSession:
                     baseline_stop_id=self.stop_id,
                     start_io_cursor=self._io_cursor,
                     timeout_sec=float(timeout_sec),
+                    kind=kind,
+                    stop_signals=stop_signals,
+                    collect=collect,
+                    restore_signal_commands=restore_signal_commands,
+                    signal_policy_restored=not bool(restore_signal_commands),
                 )
                 self._execution_jobs[job.job_id] = job
             try:
@@ -1052,7 +1615,11 @@ class GdbSession:
                 elif (
                     self.run_state == "stopped" and self.stop_id > job.baseline_stop_id
                 ):
-                    self._finish_job(job, "stopped")
+                    if job.kind == "crash":
+                        job.state = "collecting"
+                        job.revision += 1
+                    else:
+                        self._finish_job(job, "stopped")
                 else:
                     job.state = "running"
                     job.revision += 1
@@ -1068,6 +1635,8 @@ class GdbSession:
 
     def _watch_execution(self, job_id: str) -> None:
         started = time.monotonic()
+        collect_crash = False
+        restore_timed_out_crash = False
         with self.condition:
             while not self._closing.is_set():
                 job = self._execution_jobs.get(job_id)
@@ -1082,6 +1651,12 @@ class GdbSession:
                     self.condition.notify_all()
                     return
                 if self.run_state == "stopped" and self.stop_id > job.baseline_stop_id:
+                    if job.kind == "crash":
+                        job.state = "collecting"
+                        job.revision += 1
+                        collect_crash = True
+                        self.condition.notify_all()
+                        break
                     self._finish_job(job, "stopped")
                     self.condition.notify_all()
                     return
@@ -1089,6 +1664,9 @@ class GdbSession:
                 if job.timeout_sec:
                     remaining = job.timeout_sec - (time.monotonic() - started)
                     if remaining <= 0:
+                        if job.kind == "crash":
+                            restore_timed_out_crash = True
+                            break
                         self._finish_job(
                             job,
                             "timed_out",
@@ -1100,6 +1678,340 @@ class GdbSession:
                         self.condition.notify_all()
                         return
                 self.condition.wait(remaining if remaining is not None else 30.0)
+        if restore_timed_out_crash:
+            restore_errors = self._restore_crash_signal_policy(job)
+            with self.condition:
+                current = self._execution_jobs.get(job_id)
+                if current is not None and not current.terminal:
+                    self._finish_job(
+                        current,
+                        "timed_out",
+                        error={
+                            "code": "execution_timeout",
+                            "message": "crash watch timed out; target was not interrupted",
+                            "restore_errors": restore_errors,
+                        },
+                    )
+                    self.condition.notify_all()
+            return
+        if collect_crash:
+            try:
+                self._complete_crash_job(job_id)
+            except Exception as exc:  # noqa: BLE001 - retain background worker failure
+                with self.condition:
+                    job = self._execution_jobs.get(job_id)
+                    if job is not None and not job.terminal:
+                        self._finish_job(
+                            job,
+                            "failed",
+                            error={
+                                "code": "evidence_collection_failed",
+                                "message": str(exc)[:2048],
+                                "exception_type": type(exc).__name__,
+                            },
+                        )
+                        self.condition.notify_all()
+
+    def start_crash_watch(
+        self,
+        *,
+        signals: list[str],
+        collect: list[str],
+        timeout_sec: float,
+    ) -> dict[str, Any]:
+        if not isinstance(signals, list) or not 1 <= len(signals) <= 32:
+            raise GdbMcpError(
+                "signals must contain 1 to 32 signal names", code="invalid_argument"
+            )
+        normalized_signals: list[str] = []
+        for item in signals:
+            if not isinstance(item, str) or not re.fullmatch(r"SIG[A-Z0-9]+", item.upper()):
+                raise GdbMcpError(
+                    "signals must use names such as SIGSEGV", code="invalid_argument"
+                )
+            name = item.upper()
+            if name not in normalized_signals:
+                normalized_signals.append(name)
+        normalized_collect = self._validate_crash_collect(collect)
+        restore_commands: list[str] = []
+        with self.command_lock:
+            if self.run_state != "stopped":
+                raise GdbMcpError(
+                    f"cannot arm a crash watch while the session is {self.run_state}",
+                    code="invalid_state",
+                    details={
+                        "run_state": self.run_state,
+                        "allowed_states": ["stopped"],
+                    },
+                    recovery=["Wait for a stop or interrupt the inferior."],
+                )
+            try:
+                for name in normalized_signals:
+                    reply = self.execute(f"info handle {name}", timeout_sec=5.0)
+                    policy = self._parse_signal_policy(name, reply.get("output", ""))
+                    if policy is None:
+                        raise GdbMcpError(
+                            f"could not parse GDB handling policy for {name}",
+                            code="invalid_response",
+                        )
+                    stop, should_print, should_pass = policy
+                    if not stop:
+                        restore_commands.append(
+                            "handle "
+                            + name
+                            + " nostop"
+                            + (" print" if should_print else " noprint")
+                            + (" pass" if should_pass else " nopass")
+                        )
+                        self.execute(f"handle {name} stop print pass", timeout_sec=5.0)
+                return self.start_execution(
+                    "continue",
+                    timeout_sec=timeout_sec,
+                    kind="crash",
+                    stop_signals=tuple(normalized_signals),
+                    collect=tuple(normalized_collect),
+                    restore_signal_commands=tuple(restore_commands),
+                )
+            except GdbMcpError:
+                for command in restore_commands:
+                    try:
+                        self.execute(command, timeout_sec=5.0)
+                    except GdbMcpError:
+                        pass
+                raise
+
+    @staticmethod
+    def _parse_signal_policy(
+        signal_name: str, output: str
+    ) -> tuple[bool, bool, bool] | None:
+        match = re.search(
+            rf"^\s*{re.escape(signal_name)}\s+(Yes|No)\s+(Yes|No)\s+(Yes|No)\b",
+            output,
+            re.MULTILINE | re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return tuple(value.lower() == "yes" for value in match.groups())  # type: ignore[return-value]
+
+    def _restore_crash_signal_policy(self, job: _ExecutionJob) -> list[str]:
+        errors: list[str] = []
+        if job.signal_policy_restored:
+            return errors
+        for command in job.restore_signal_commands:
+            try:
+                self.execute(command, timeout_sec=5.0)
+            except GdbMcpError as exc:
+                # Some remote targets apply `handle` and then return an error
+                # merely because the inferior is running. Trust the observed
+                # policy, not that self-contradictory result record.
+                match = re.fullmatch(
+                    r"handle\s+(SIG[A-Z0-9]+)\s+(stop|nostop)\s+"
+                    r"(print|noprint)\s+(pass|nopass)",
+                    command,
+                )
+                verified = False
+                verification_error = None
+                if match:
+                    try:
+                        reply = self.execute(
+                            f"info handle {match.group(1)}", timeout_sec=5.0
+                        )
+                        observed = self._parse_signal_policy(
+                            match.group(1), reply.get("output", "")
+                        )
+                        expected = (
+                            match.group(2) == "stop",
+                            match.group(3) == "print",
+                            match.group(4) == "pass",
+                        )
+                        verified = observed == expected
+                    except GdbMcpError as verify_exc:
+                        verification_error = (
+                            f"; verification failed: {verify_exc.code}: "
+                            f"{verify_exc.message}"
+                        )
+                if not verified:
+                    errors.append(
+                        f"{command}: {exc.code}: {exc.message}"
+                        + (verification_error or "")
+                    )
+        job.signal_policy_restored = not errors
+        return errors
+
+    def _validate_crash_collect(self, collect: list[str]) -> list[str]:
+        if not isinstance(collect, list) or not 1 <= len(collect) <= 16:
+            raise GdbMcpError(
+                "collect must contain 1 to 16 evidence specifications",
+                code="invalid_argument",
+            )
+        normalized: list[str] = []
+        total_memory = 0
+        for item in collect:
+            if not isinstance(item, str) or not item.strip() or len(item) > 4096:
+                raise GdbMcpError(
+                    "each collect item must be a non-empty string",
+                    code="invalid_argument",
+                )
+            if item in {"backtrace", "registers"}:
+                normalized.append(item)
+                continue
+            if item.startswith("memory:"):
+                try:
+                    expression, raw_size = item.removeprefix("memory:").rsplit(",", 1)
+                    size = int(raw_size, 0)
+                except (ValueError, TypeError) as exc:
+                    raise GdbMcpError(
+                        "memory evidence must be memory:<expression>,<bytes>",
+                        code="invalid_argument",
+                    ) from exc
+                if not expression.strip() or any(char in expression for char in "\r\n\x00"):
+                    raise GdbMcpError(
+                        "memory expression must be one non-empty line",
+                        code="invalid_argument",
+                    )
+                if not 1 <= size <= 4096:
+                    raise GdbMcpError(
+                        "each memory evidence range must be 1 to 4096 bytes",
+                        code="invalid_argument",
+                    )
+                total_memory += size
+                if total_memory > 16 * 1024:
+                    raise GdbMcpError(
+                        "total crash memory evidence exceeds 16384 bytes",
+                        code="invalid_argument",
+                    )
+                normalized.append(f"memory:{expression},{size}")
+                continue
+            raise GdbMcpError(
+                "collect items must be backtrace, registers, or memory:<expression>,<bytes>",
+                code="invalid_argument",
+            )
+        return normalized
+
+    def _complete_crash_job(self, job_id: str) -> None:
+        with self.command_lock:
+            with self.condition:
+                job = self._execution_jobs.get(job_id)
+                if job is None or job.terminal or job.cancel_requested:
+                    return
+                stop_id = self.stop_id
+                stop = dict(self.last_stop or {})
+                signal_name = str(stop.get("signal-name") or "").upper()
+                matched = (
+                    stop.get("reason") == "signal-received"
+                    and signal_name in job.stop_signals
+                )
+            if not matched:
+                restore_errors = self._restore_crash_signal_policy(job)
+                with self.condition:
+                    current = self._execution_jobs.get(job_id)
+                    if current is None or current.terminal:
+                        return
+                    self._finish_job(
+                        current,
+                        "unexpected_stop",
+                        error={
+                            "code": "unexpected_stop",
+                            "message": "target stopped for a reason other than a selected crash signal",
+                            "stop": bounded_value(stop),
+                            "restore_errors": restore_errors,
+                        },
+                    )
+                    self.condition.notify_all()
+                    return
+            evidence = self._collect_crash_evidence(
+                stop_id=stop_id, stop=stop, collect=job.collect
+            )
+            with self.condition:
+                current = self._execution_jobs.get(job_id)
+                if current is None or current.terminal:
+                    return
+            restore_errors = self._restore_crash_signal_policy(current)
+            with self.condition:
+                current = self._execution_jobs.get(job_id)
+                if current is None or current.terminal:
+                    return
+                if restore_errors:
+                    evidence["partial"] = True
+                    evidence.setdefault("errors", {})["signal_policy_restore"] = restore_errors
+                current.evidence = evidence
+                self._finish_job(current, "crashed")
+                self._append_internal_event(
+                    "crash-captured",
+                    {
+                        "job_id": job_id,
+                        "stop_id": stop_id,
+                        "signal": signal_name,
+                        "partial": evidence.get("partial", False),
+                    },
+                )
+                self.condition.notify_all()
+
+    def _collect_crash_evidence(
+        self, *, stop_id: int, stop: dict[str, Any], collect: tuple[str, ...]
+    ) -> dict[str, Any]:
+        evidence: dict[str, Any] = {
+            "stop_id": stop_id,
+            "stop": bounded_value(stop),
+            "backtrace": None,
+            "registers": None,
+            "memory": [],
+        }
+        errors: dict[str, Any] = {}
+
+        def run(name: str, command: str, timeout: float = 15.0) -> Any:
+            try:
+                reply = self.execute(command, timeout_sec=timeout)
+                if self.stop_id != stop_id or self.run_state != "stopped":
+                    raise GdbMcpError(
+                        "stop epoch changed while collecting crash evidence",
+                        code="stale_stop",
+                    )
+                return reply.get("payload")
+            except GdbMcpError as exc:
+                errors[name] = {"code": exc.code, "message": exc.message}
+                return None
+
+        if "backtrace" in collect:
+            payload = run("backtrace", "-stack-list-frames 0 63")
+            evidence["backtrace"] = (
+                payload.get("stack", []) if isinstance(payload, dict) else []
+            )
+        if "registers" in collect:
+            if self.register_names is None:
+                payload = run("register_names", "-data-list-register-names")
+                names = payload.get("register-names", []) if isinstance(payload, dict) else []
+                self.register_names = [str(name) for name in names]
+            payload = run("registers", "-data-list-register-values x")
+            values = payload.get("register-values", []) if isinstance(payload, dict) else []
+            registers: dict[str, str] = {}
+            for item in values if isinstance(values, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item["number"])
+                    name = self.register_names[index] if self.register_names else str(index)
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
+                if name in _GENERAL_REGISTER_NAMES:
+                    registers[name] = str(item.get("value", ""))
+            evidence["registers"] = registers
+        for index, item in enumerate(collect):
+            if not item.startswith("memory:"):
+                continue
+            expression, raw_size = item.removeprefix("memory:").rsplit(",", 1)
+            size = int(raw_size)
+            payload = run(
+                f"memory:{index}",
+                f"-data-read-memory-bytes {mi_quote(expression)} {size}",
+            )
+            evidence["memory"].append(
+                {"expression": expression, "bytes": size, "payload": payload}
+            )
+        evidence["partial"] = bool(errors)
+        evidence["errors"] = errors
+        evidence["collected_at"] = time.time()
+        return bounded_value(evidence)
 
     def _finish_job(
         self,
@@ -1200,7 +2112,52 @@ class GdbSession:
             job.state = "cancelling"
             job.revision += 1
             self.condition.notify_all()
-        interrupt = self.interrupt(timeout_sec=timeout_sec)
+        try:
+            interrupt = self.interrupt(timeout_sec=timeout_sec)
+        except GdbMcpError as exc:
+            # A remote stub can acknowledge -exec-interrupt without ever
+            # publishing the asynchronous stop.  Do not leave the retained
+            # job permanently wedged in the non-terminal "cancelling" state.
+            with self.condition:
+                if not job.terminal:
+                    self._finish_job(
+                        job,
+                        "failed",
+                        error={
+                            "code": "cancel_failed",
+                            "message": exc.message,
+                            "cause": {
+                                "code": exc.code,
+                                "retryable": exc.retryable,
+                                "details": exc.details,
+                            },
+                        },
+                    )
+            restore_errors = (
+                self._restore_crash_signal_policy(job)
+                if job.kind == "crash"
+                else []
+            )
+            with self.condition:
+                if job.error is not None:
+                    job.error["restore_errors"] = restore_errors
+                snapshot = job.snapshot()
+                self.condition.notify_all()
+            raise GdbMcpError(
+                exc.message,
+                code=exc.code,
+                retryable=exc.retryable,
+                details={
+                    **exc.details,
+                    "job_id": job_id,
+                    "job": snapshot,
+                    "restore_errors": restore_errors,
+                },
+                recovery=exc.recovery,
+            ) from exc
+        restore_errors = (
+            self._restore_crash_signal_policy(job) if job.kind == "crash" else []
+        )
         with self.condition:
             if not job.terminal or job.state == "timed_out":
                 self._finish_job(job, "cancelled")
@@ -1208,6 +2165,7 @@ class GdbSession:
             return {
                 "already_terminal": False,
                 "interrupt": interrupt,
+                "restore_errors": restore_errors,
                 "job": job.snapshot(),
             }
 
@@ -1464,6 +2422,10 @@ class GdbSession:
             "non_stop": "is on" in non_stop_output,
             "inferior_tty": self.inferior_tty_path is not None,
             "async_events": True,
+            "adapters": {
+                "rr": shutil.which("rr"),
+                "objcopy": shutil.which("objcopy"),
+            },
             "errors": errors,
         }
         with self.condition:

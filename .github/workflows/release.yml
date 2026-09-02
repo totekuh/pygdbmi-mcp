@@ -87,7 +87,7 @@ jobs:
           {
             echo "# pygdbmi-mcp ${TAG}"
             echo
-            echo "MCP server exposing GDB debugging via pygdbmi — **73 tools** backed by a persistent token-correlated MI dispatcher, versioned results, state gating, retained execution jobs, multi-inferior topology, cached capabilities, cursor-paged evidence and inferior PTY I/O, atomic context/batches, variable objects, and full local/attach/remote/core workflows."
+            echo "MCP server exposing GDB debugging via pygdbmi — **89 tools** backed by a persistent token-correlated MI dispatcher, managed logging breakpoints, crash evidence capture, connection profiles, JSON symbol import, module/RVA identity, reverse execution, retained jobs, and full local/attach/remote/core workflows."
             echo
             echo "## Install"
             echo

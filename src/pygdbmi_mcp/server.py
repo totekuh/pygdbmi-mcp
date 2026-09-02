@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
+import os
 import re
+import select
+import shutil
+import subprocess
+import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,6 +35,7 @@ from .runtime import (
     cli_quote,
     mi_quote,
 )
+from .research import collect_modules, load_symbols_json, resolve_address
 
 CleanupPolicy = Literal["auto", "kill", "detach", "disconnect", "quit"]
 CommandMode = Literal["auto", "mi", "console"]
@@ -36,6 +43,8 @@ RegisterSet = Literal["general", "all"]
 WordSize = Literal[1, 2, 4, 8]
 ExecutionAction = Literal["run", "continue", "step", "next", "finish", "until"]
 FollowFork = Literal["parent", "child"]
+RecordMethod = Literal["auto", "full", "btrace"]
+ReverseAction = Literal["continue", "step", "next", "finish"]
 NonNegative = Annotated[int, Field(ge=0)]
 Positive = Annotated[int, Field(ge=1)]
 EventLimit = Annotated[int, Field(ge=1, le=500)]
@@ -46,6 +55,8 @@ InferiorOutputLimit = Annotated[int, Field(ge=1, le=MAX_OUTPUT_PAGE)]
 ExecutionTimeout = Annotated[float, Field(ge=0, le=86400)]
 MemoryCount = Annotated[int, Field(ge=1, le=65536)]
 SmallCount = Annotated[int, Field(ge=1, le=1000)]
+BreakpointHitLimit = Annotated[int, Field(ge=1, le=100000)]
+TraceDepth = Annotated[int, Field(ge=0, le=64)]
 
 ANY_STATE = frozenset({"idle", "running", "stopped", "exited", "indeterminate"})
 NOT_RUNNING = frozenset({"idle", "stopped", "exited"})
@@ -69,6 +80,8 @@ mcp = FastMCP(
         "retained start/poll/cancel workflows; direct execution returns on ^running and "
         "uses gdb_wait_for_stop with the previous stop_id. Cache gdb_capabilities, prefer "
         "gdb_context over many inspection calls, and inspect gdb_inferiors after fork/exec. "
+        "Use gdb_log_breakpoint for auto-continuing sink traces, gdb_catch_crash for retained "
+        "fatal-signal evidence, and gdb_modules before translating runtime addresses. "
         "Every tool returns pygdbmi.mcp/1; check ok before result. Page large output "
         "through gdb_output_page and stop sessions explicitly."
     ),
@@ -172,6 +185,52 @@ def _reply(session: GdbSession, command: str, timeout: float = 10) -> dict[str, 
 
 def _payload(reply: dict[str, Any]) -> Any:
     return reply.get("payload")
+
+
+def _notification_result(reply: dict[str, Any], compact: bool) -> dict[str, Any]:
+    if not isinstance(compact, bool):
+        raise GdbMcpError("compact must be boolean", code="invalid_argument")
+    if not compact:
+        return reply
+    result = dict(reply)
+    result["notifications"] = []
+    result["notifications_omitted"] = int(reply.get("notification_count", 0))
+    return result
+
+
+def _complete_remote_connection(
+    session: GdbSession,
+    reply: dict[str, Any],
+    *,
+    baseline_stop_id: int,
+    extended_remote: bool,
+) -> dict[str, Any]:
+    """Wait until target-select's asynchronous state is real and observable."""
+    session.target_kind = "remote"
+    if extended_remote:
+        topology = session.inferiors(refresh=True)
+        if topology["active_count"] == 0:
+            session.set_state("idle", clear_stop=True)
+            session.refresh_target_traits()
+            return reply
+    ready = session.wait_for_stop(after_stop_id=baseline_stop_id, timeout_sec=10.0)
+    if ready["reason"] != "stopped":
+        session.set_state("indeterminate")
+        raise GdbMcpError(
+            "remote target connected but did not publish its initial stop",
+            code="target_state_timeout",
+            retryable=True,
+            details={
+                "reason": ready["reason"],
+                "baseline_stop_id": baseline_stop_id,
+                "command_id": reply.get("command_id"),
+            },
+            recovery=[
+                "Inspect gdb_events, interrupt the target, or reconnect the session."
+            ],
+        )
+    session.refresh_target_traits()
+    return reply
 
 
 def _catalog() -> dict[str, Any]:
@@ -363,6 +422,54 @@ def gdb_execution_cancel(
     return manager.get(session_id).cancel_execution(
         job_id, timeout_sec=float(timeout_sec)
     )
+
+
+@gdb_tool(destructive=True)
+def gdb_catch_crash(
+    session_id: str,
+    signals: list[str] | None = None,
+    collect: list[str] | None = None,
+    timeout_sec: ExecutionTimeout = 60,
+    wait_timeout: WaitTimeout = 0,
+) -> dict[str, Any]:
+    """Continue under a retained fatal-signal filter and capture bounded evidence."""
+    session = manager.get(session_id)
+    job = session.start_crash_watch(
+        signals=(
+            ["SIGSEGV", "SIGABRT", "SIGBUS", "SIGILL", "SIGFPE"]
+            if signals is None
+            else signals
+        ),
+        collect=(
+            ["backtrace", "registers", "memory:$sp,256"]
+            if collect is None
+            else collect
+        ),
+        timeout_sec=float(timeout_sec),
+    )
+    if wait_timeout:
+        deadline = time.monotonic() + float(wait_timeout)
+        current = job
+        terminal = {
+            "stopped",
+            "exited",
+            "cancelled",
+            "timed_out",
+            "failed",
+            "crashed",
+            "unexpected_stop",
+        }
+        while current["state"] not in terminal:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            current = session.execution_status(
+                job["job_id"],
+                after_revision=current["revision"],
+                wait_timeout=remaining,
+            )
+        return current
+    return job
 
 
 @gdb_tool(states=NOT_RUNNING, read_only=True, idempotent=True)
@@ -696,24 +803,31 @@ def gdb_attach(session_id: str, pid: Positive) -> dict[str, Any]:
 
 @gdb_tool(states=NOT_RUNNING, destructive=True, open_world=True)
 def gdb_remote_connect(
-    session_id: str, target: str, extended_remote: bool = False
+    session_id: str,
+    target: str,
+    extended_remote: bool = False,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Connect to a GDB remote target such as host:port or a serial device."""
     session = manager.get(session_id)
     kind = "extended-remote" if extended_remote else "remote"
+    baseline_stop_id = session.stop_id
     reply = _reply(
         session,
         f"-target-select {kind} {_require_single_line(target, 'target')}",
         30,
     )
-    session.target_kind = "remote"
-    session.set_state("stopped")
-    session.refresh_target_traits()
-    return reply
+    reply = _complete_remote_connection(
+        session,
+        reply,
+        baseline_stop_id=baseline_stop_id,
+        extended_remote=extended_remote,
+    )
+    return _notification_result(reply, compact)
 
 
 @gdb_tool(states=NOT_RUNNING, destructive=True, idempotent=True, open_world=True)
-def gdb_remote_disconnect(session_id: str) -> dict[str, Any]:
+def gdb_remote_disconnect(session_id: str, compact: bool = False) -> dict[str, Any]:
     """Disconnect a remote target without killing it."""
     session = manager.get(session_id)
     reply = _reply(session, "-target-disconnect", 10)
@@ -724,7 +838,215 @@ def gdb_remote_disconnect(session_id: str) -> dict[str, Any]:
     session.selected_frame = 0
     session.set_state("idle", clear_stop=True)
     session.invalidate_capabilities()
-    return reply
+    return _notification_result(reply, compact)
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True, open_world=True)
+def gdb_connect_profile(
+    session_id: str,
+    profile: dict[str, Any],
+    compact: bool = True,
+) -> dict[str, Any]:
+    """Apply bounded inline target setup and connect to a remote target in one call."""
+    if not isinstance(profile, dict):
+        raise GdbMcpError("profile must be an object", code="invalid_argument")
+    allowed = {
+        "architecture",
+        "sysroot",
+        "target",
+        "endian",
+        "commands",
+        "extended_remote",
+    }
+    unknown = sorted(set(profile).difference(allowed))
+    if unknown:
+        raise GdbMcpError(
+            "profile contains unknown fields",
+            code="invalid_argument",
+            details={"unknown": unknown},
+        )
+    target = profile.get("target")
+    if not isinstance(target, str):
+        raise GdbMcpError("profile.target must be a string", code="invalid_argument")
+    target = _require_single_line(target, "target")
+    commands = profile.get("commands", [])
+    if not isinstance(commands, list) or not 0 <= len(commands) <= 16 or not all(
+        isinstance(command, str) for command in commands
+    ):
+        raise GdbMcpError(
+            "profile.commands must contain at most 16 strings",
+            code="invalid_argument",
+        )
+    architecture = profile.get("architecture", "")
+    sysroot = profile.get("sysroot", "")
+    endian = profile.get("endian", "")
+    extended_remote = profile.get("extended_remote", False)
+    for name, value in (("architecture", architecture), ("sysroot", sysroot)):
+        if not isinstance(value, str) or len(value) > 4096 or any(
+            char in value for char in "\r\n\x00"
+        ):
+            raise GdbMcpError(
+                f"profile.{name} must be one string of at most 4096 characters",
+                code="invalid_argument",
+            )
+    if endian not in {"", "auto", "little", "big"}:
+        raise GdbMcpError(
+            "profile.endian must be auto, little, or big", code="invalid_argument"
+        )
+    if not isinstance(extended_remote, bool):
+        raise GdbMcpError(
+            "profile.extended_remote must be boolean", code="invalid_argument"
+        )
+    commands = [
+        _require_single_line(command, "profile command") for command in commands
+    ]
+    session = manager.get(session_id)
+    setup: list[dict[str, Any]] = []
+    with session.command_lock:
+        try:
+            if architecture:
+                setup.append(
+                    _reply(
+                        session,
+                        f"set architecture {_require_single_line(architecture, 'architecture')}",
+                        10,
+                    )
+                )
+            if sysroot:
+                local_root = str(Path(sysroot).expanduser().resolve())
+                setup.append(_reply(session, f"set sysroot {cli_quote(local_root)}", 10))
+                session.sysroot = local_root
+            if endian:
+                setup.append(_reply(session, f"set endian {endian}", 10))
+            for command in commands:
+                setup.append(_reply(session, command, 30))
+            kind = "extended-remote" if extended_remote else "remote"
+            baseline_stop_id = session.stop_id
+            connected = _reply(
+                session,
+                f"-target-select {kind} {target}",
+                30,
+            )
+        except GdbMcpError as exc:
+            raise GdbMcpError(
+                exc.message,
+                code=exc.code,
+                retryable=exc.retryable,
+                details={**exc.details, "setup_steps_completed": len(setup)},
+                recovery=exc.recovery,
+            ) from exc
+        connected = _complete_remote_connection(
+            session,
+            connected,
+            baseline_stop_id=baseline_stop_id,
+            extended_remote=extended_remote,
+        )
+        return {
+            "setup": setup,
+            "connected": _notification_result(connected, compact),
+            "profile": {
+                "architecture": architecture or None,
+                "sysroot": session.sysroot,
+                "target": target,
+                "endian": endian or None,
+                "command_count": len(commands),
+                "extended_remote": extended_remote,
+            },
+        }
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True, open_world=True)
+def gdb_rr_replay(
+    session_id: str,
+    trace_dir: str,
+    rr_path: str = "rr",
+    startup_timeout_sec: CommandTimeout = 15,
+    compact: bool = True,
+) -> dict[str, Any]:
+    """Launch an rr replay server on a random local port and connect this session."""
+    session = manager.get(session_id)
+    executable = shutil.which(rr_path)
+    if executable is None:
+        raise GdbMcpError(
+            f"rr executable {rr_path!r} was not found", code="adapter_unavailable"
+        )
+    trace = Path(trace_dir).expanduser().resolve()
+    if not trace.is_dir():
+        raise GdbMcpError("trace_dir must be an rr trace directory", code="invalid_argument")
+    try:
+        process = subprocess.Popen(
+            [executable, "replay", "-s", "0", str(trace)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        raise GdbMcpError(
+            f"could not launch rr: {exc}", code="adapter_unavailable"
+        ) from exc
+    output: list[str] = []
+    port = None
+    deadline = time.monotonic() + float(startup_timeout_sec)
+    try:
+        while time.monotonic() < deadline and process.poll() is None:
+            if process.stdout is None:
+                break
+            readable, _, _ = select.select(
+                [process.stdout], [], [], min(0.25, deadline - time.monotonic())
+            )
+            if not readable:
+                continue
+            line = process.stdout.readline()
+            if not line:
+                continue
+            output.append(line[:4096])
+            joined = "".join(output)[-16_384:]
+            match = re.search(
+                r"(?:Listening on (?:port |[^:\s]+:)|localhost:)(\d{1,5})",
+                joined,
+                re.IGNORECASE,
+            )
+            if match:
+                port = int(match.group(1))
+                break
+        if port is None:
+            raise GdbMcpError(
+                "rr replay did not publish a listening port",
+                code="adapter_start_timeout" if process.poll() is None else "adapter_failed",
+                details={"output": "".join(output)[-16_384:], "returncode": process.poll()},
+            )
+        with session.command_lock:
+            baseline_stop_id = session.stop_id
+            connected = _reply(
+                session, f"-target-select extended-remote localhost:{port}", 30
+            )
+            connected = _complete_remote_connection(
+                session,
+                connected,
+                baseline_stop_id=baseline_stop_id,
+                extended_remote=True,
+            )
+            session._adapter_processes.append(process)
+        return {
+            "adapter": "rr",
+            "trace_dir": str(trace),
+            "pid": process.pid,
+            "port": port,
+            "startup_output": "".join(output)[-16_384:],
+            "connected": _notification_result(connected, compact),
+        }
+    except Exception:
+        if process not in session._adapter_processes:
+            try:
+                process.terminate()
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        raise
 
 
 @gdb_tool(states=NOT_RUNNING, destructive=True, open_world=True)
@@ -765,6 +1087,99 @@ def gdb_add_symbol_file(
     if address:
         command += f" {_require_single_line(address, 'address')}"
     return _reply(manager.get(session_id), command, 30)
+
+
+@gdb_tool(destructive=True, open_world=True)
+def gdb_load_symbols_json(
+    session_id: str,
+    file: str,
+    format: Literal["ghidra-decomp", "exports", "plain"] = "ghidra-decomp",
+    base_address: str = "",
+    analysis_base_address: str = "",
+    binary_path: str = "",
+) -> dict[str, Any]:
+    """Convert bounded address/name data into a temporary ELF symbol companion and load it."""
+    return load_symbols_json(
+        manager.get(session_id),
+        file=file,
+        format_name=format,
+        base_address=base_address,
+        analysis_base_address=analysis_base_address,
+        binary_path=binary_path,
+    )
+
+
+@gdb_tool(read_only=True, idempotent=True, open_world=True)
+def gdb_modules(
+    session_id: str,
+    include_sections: bool = False,
+    include_hashes: bool = False,
+    max_sections: Annotated[int, Field(ge=1, le=4096)] = 256,
+    sysroot: str = "",
+) -> dict[str, Any]:
+    """Normalize mappings, modules, ELF identity, load slides, sections, and debug evidence."""
+    return collect_modules(
+        manager.get(session_id),
+        include_sections=include_sections,
+        include_hashes=include_hashes,
+        max_sections=int(max_sections),
+        sysroot=sysroot,
+    )
+
+
+@gdb_tool(read_only=True, idempotent=True, open_world=True)
+def gdb_address_info(
+    session_id: str,
+    address: str,
+    sysroot: str = "",
+) -> dict[str, Any]:
+    """Resolve a runtime address to exact module identity, linked VA, RVA, and section."""
+    raw_address = _require_single_line(address, "address")
+    session = manager.get(session_id)
+    expression_stop_id = None
+    try:
+        value = int(raw_address, 0)
+    except ValueError:
+        with session.command_lock:
+            if session.run_state != "stopped":
+                raise GdbMcpError(
+                    "non-literal addresses require a stopped target",
+                    code="invalid_argument",
+                )
+            expression_stop_id = session.stop_id
+            payload = _payload(
+                _reply(
+                    session,
+                    f"-data-evaluate-expression {mi_quote(raw_address)}",
+                    10,
+                )
+            )
+        rendered = payload.get("value", "") if isinstance(payload, dict) else ""
+        match = re.match(r"0x[0-9a-fA-F]+", str(rendered))
+        if not match:
+            raise GdbMcpError(
+                "address expression did not evaluate to an address",
+                code="invalid_argument",
+            )
+        value = int(match.group(0), 16)
+    modules = collect_modules(
+        session,
+        include_sections=True,
+        include_hashes=False,
+        max_sections=4096,
+        sysroot=sysroot,
+    )
+    if expression_stop_id is not None and modules["stop_id"] != expression_stop_id:
+        raise GdbMcpError(
+            "stop epoch changed while resolving the address expression",
+            code="stale_stop",
+            details={
+                "expression_stop_id": expression_stop_id,
+                "module_stop_id": modules["stop_id"],
+            },
+            retryable=True,
+        )
+    return {**resolve_address(modules, value), "stop_id": modules["stop_id"]}
 
 
 @gdb_tool(states=RUNNABLE, destructive=True)
@@ -819,18 +1234,96 @@ def gdb_signal(session_id: str, sig: str) -> dict[str, Any]:
     return _reply(manager.get(session_id), f"signal {sig}", 10)
 
 
+@gdb_tool(states=STOPPED, destructive=True)
+def gdb_record_start(
+    session_id: str,
+    method: RecordMethod = "auto",
+) -> dict[str, Any]:
+    """Start GDB process recording with explicit btrace/full fallback evidence."""
+    if method not in {"auto", "full", "btrace"}:
+        raise GdbMcpError(
+            "method must be auto, full, or btrace", code="invalid_argument"
+        )
+    session = manager.get(session_id)
+    methods = ["btrace", "full"] if method == "auto" else [method]
+    errors: dict[str, Any] = {}
+    with session.command_lock:
+        for candidate in methods:
+            try:
+                reply = _reply(session, f"record {candidate}", 30)
+                return {
+                    "method": candidate,
+                    "requested": method,
+                    "reply": reply,
+                    "fallback_errors": errors,
+                }
+            except GdbMcpError as exc:
+                errors[candidate] = {"code": exc.code, "message": exc.message}
+    raise GdbMcpError(
+        "no requested GDB recording backend could start",
+        code="record_unavailable",
+        details={"requested": method, "errors": errors},
+    )
+
+
+@gdb_tool(states=NOT_RUNNING, read_only=True, idempotent=True)
+def gdb_record_status(session_id: str) -> dict[str, Any]:
+    """Return bounded GDB recording status and active instruction bounds."""
+    return _reply(manager.get(session_id), "info record", 15)
+
+
+@gdb_tool(states=STOPPED, destructive=True, idempotent=True)
+def gdb_record_stop(session_id: str) -> dict[str, Any]:
+    """Stop and discard the active GDB recording target."""
+    return _reply(manager.get(session_id), "record stop", 15)
+
+
+@gdb_tool(states=STOPPED, destructive=True)
+def gdb_reverse(
+    session_id: str,
+    action: ReverseAction = "continue",
+    instruction: bool = False,
+) -> dict[str, Any]:
+    """Start a reverse continue/step/next/finish operation and return on ^running."""
+    commands = {
+        "continue": "reverse-continue",
+        "step": "reverse-stepi" if instruction else "reverse-step",
+        "next": "reverse-nexti" if instruction else "reverse-next",
+        "finish": "reverse-finish",
+    }
+    if action not in commands:
+        raise GdbMcpError(
+            "action must be continue, step, next, or finish", code="invalid_argument"
+        )
+    if action == "finish" and instruction:
+        raise GdbMcpError(
+            "instruction is not valid for reverse finish", code="invalid_argument"
+        )
+    return _reply(manager.get(session_id), commands[action], 30)
+
+
 # Breakpoints ---------------------------------------------------------------
 
 
-@gdb_tool(states=NOT_RUNNING, destructive=True)
-def gdb_breakpoint(
-    session_id: str,
-    location: str,
-    condition: str = "",
-    temporary: bool = False,
-    hardware: bool = False,
-) -> dict[str, Any]:
-    """Set a normal, conditional, temporary, or hardware breakpoint."""
+def _breakpoint_command(
+    location: str, condition: str, temporary: bool, hardware: bool
+) -> str:
+    if not isinstance(location, str) or not isinstance(condition, str):
+        raise GdbMcpError(
+            "location and condition must be strings", code="invalid_argument"
+        )
+    if not isinstance(temporary, bool) or not isinstance(hardware, bool):
+        raise GdbMcpError(
+            "temporary and hardware must be boolean", code="invalid_argument"
+        )
+    _require_single_line(location, "location")
+    if len(location) > 4096:
+        raise GdbMcpError("location is too long", code="invalid_argument")
+    if len(condition) > 4096 or "\n" in condition or "\r" in condition:
+        raise GdbMcpError(
+            "condition must be one line of at most 4096 characters",
+            code="invalid_argument",
+        )
     command = "-break-insert"
     if temporary:
         command += " -t"
@@ -838,8 +1331,122 @@ def gdb_breakpoint(
         command += " -h"
     if condition:
         command += f" -c {mi_quote(condition)}"
-    command += f" {mi_quote(location)}"
-    return _reply(manager.get(session_id), command, 10)
+    return command + f" {mi_quote(location)}"
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True)
+def gdb_breakpoint(
+    session_id: str,
+    location: str = "",
+    condition: str = "",
+    temporary: bool = False,
+    hardware: bool = False,
+    locations: list[str] | None = None,
+) -> dict[str, Any]:
+    """Set one breakpoint, or up to 128 independently reported bulk breakpoints."""
+    if locations is not None and location:
+        raise GdbMcpError(
+            "use either location or locations, not both", code="invalid_argument"
+        )
+    if locations is None:
+        session = manager.get(session_id)
+        reply = _reply(
+            session,
+            _breakpoint_command(location, condition, temporary, hardware),
+            10,
+        )
+        session.reject_managed_breakpoint_conflict(reply, location)
+        return reply
+    if not isinstance(locations, list) or not 1 <= len(locations) <= 128 or not all(
+        isinstance(item, str) for item in locations
+    ):
+        raise GdbMcpError(
+            "locations must contain 1 to 128 strings", code="invalid_argument"
+        )
+    session = manager.get(session_id)
+    items: list[dict[str, Any]] = []
+    with session.command_lock:
+        for index, item in enumerate(locations):
+            try:
+                reply = _reply(
+                    session,
+                    _breakpoint_command(item, condition, temporary, hardware),
+                    10,
+                )
+                session.reject_managed_breakpoint_conflict(reply, item)
+                items.append(
+                    {"index": index, "location": item, "ok": True, "reply": reply}
+                )
+            except GdbMcpError as exc:
+                items.append(
+                    {
+                        "index": index,
+                        "location": item,
+                        "ok": False,
+                        "error": {"code": exc.code, "message": exc.message},
+                    }
+                )
+    return {
+        "items": items,
+        "requested": len(locations),
+        "created": sum(item["ok"] for item in items),
+        "failed": sum(not item["ok"] for item in items),
+    }
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True)
+def gdb_log_breakpoint(
+    session_id: str,
+    location: str,
+    expressions: list[str],
+    condition: str = "",
+    limit: BreakpointHitLimit = 100,
+    backtrace_depth: TraceDepth = 0,
+) -> dict[str, Any]:
+    """Create a bounded expression/backtrace logger that auto-continues its stops."""
+    return manager.get(session_id).create_log_breakpoint(
+        location,
+        expressions=expressions,
+        condition=condition,
+        limit=int(limit),
+        backtrace_depth=int(backtrace_depth),
+    )
+
+
+@gdb_tool(read_only=True, idempotent=True)
+def gdb_log_read(
+    session_id: str,
+    log_id: str,
+    after_cursor: NonNegative = 0,
+    limit: EventLimit = 50,
+    encoding: Literal["json", "jsonl"] = "json",
+) -> dict[str, Any]:
+    """Read retained logging-breakpoint hits using a monotonic per-log cursor."""
+    if encoding not in {"json", "jsonl"}:
+        raise GdbMcpError("encoding must be json or jsonl", code="invalid_argument")
+    result = manager.get(session_id).read_log_breakpoint(
+        log_id, after_cursor=int(after_cursor), limit=int(limit)
+    )
+    if encoding == "jsonl":
+        result["jsonl"] = "\n".join(
+            json.dumps(item, separators=(",", ":"), sort_keys=True)
+            for item in result["hits"]
+        )
+        result["hits"] = []
+    result["encoding"] = encoding
+    return result
+
+
+@gdb_tool(read_only=True, idempotent=True)
+def gdb_log_list(session_id: str) -> dict[str, Any]:
+    """List retained logging breakpoints and their hit counts."""
+    return manager.get(session_id).list_log_breakpoints()
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True, idempotent=True)
+def gdb_log_delete(session_id: str, log_id: str) -> dict[str, Any]:
+    """Delete a managed logging breakpoint and its retained evidence."""
+    return manager.get(session_id).delete_log_breakpoint(log_id)
 
 
 @gdb_tool(states=NOT_RUNNING, destructive=True, idempotent=True)
@@ -1208,6 +1815,113 @@ def gdb_show(session_id: str, setting: str) -> dict[str, Any]:
     return _reply(
         manager.get(session_id), f"show {_require_single_line(setting, 'setting')}", 10
     )
+
+
+@gdb_tool(states=NOT_RUNNING, destructive=True, open_world=True)
+def gdb_debug_config(
+    session_id: str,
+    source_substitutions: list[dict[str, str]] | None = None,
+    debug_directories: list[str] | None = None,
+    debuginfod: bool = False,
+) -> dict[str, Any]:
+    """Configure source maps and split-debug lookup; network fetch stays off by default."""
+    substitutions = source_substitutions or []
+    directories = debug_directories or []
+    if not isinstance(substitutions, list) or len(substitutions) > 64:
+        raise GdbMcpError(
+            "source_substitutions must contain at most 64 mappings",
+            code="invalid_argument",
+        )
+    if not isinstance(directories, list) or len(directories) > 64 or not all(
+        isinstance(item, str) for item in directories
+    ):
+        raise GdbMcpError(
+            "debug_directories must contain at most 64 paths",
+            code="invalid_argument",
+        )
+    if not isinstance(debuginfod, bool):
+        raise GdbMcpError("debuginfod must be boolean", code="invalid_argument")
+    session = manager.get(session_id)
+    replies: list[dict[str, Any]] = []
+    normalized_substitutions: list[dict[str, str]] = []
+    normalized_directories: list[str] = []
+    with session.command_lock:
+        for index, mapping in enumerate(substitutions):
+            if not isinstance(mapping, dict) or set(mapping) != {"from", "to"}:
+                raise GdbMcpError(
+                    f"source substitution {index} must contain only from and to",
+                    code="invalid_argument",
+                )
+            source = mapping.get("from")
+            target = mapping.get("to")
+            if not isinstance(source, str) or not isinstance(target, str):
+                raise GdbMcpError(
+                    f"source substitution {index} paths must be strings",
+                    code="invalid_argument",
+                )
+            source = _require_single_line(source, "source path")
+            target = str(
+                Path(_require_single_line(target, "local source path"))
+                .expanduser()
+                .resolve()
+            )
+            replies.append(
+                _reply(
+                    session,
+                    f"set substitute-path {cli_quote(source)} {cli_quote(target)}",
+                    10,
+                )
+            )
+            normalized_substitutions.append({"from": source, "to": target})
+        if debug_directories is not None:
+            for directory in directories:
+                path = str(
+                    Path(_require_single_line(directory, "debug directory"))
+                    .expanduser()
+                    .resolve()
+                )
+                normalized_directories.append(path)
+            replies.append(
+                _reply(
+                    session,
+                    f"set debug-file-directory {cli_quote(os.pathsep.join(normalized_directories))}",
+                    10,
+                )
+            )
+        replies.append(
+            _reply(
+                session,
+                f"set debuginfod enabled {'on' if debuginfod else 'off'}",
+                10,
+            )
+        )
+        session.source_substitutions.extend(normalized_substitutions)
+        if debug_directories is not None:
+            session.debug_directories = normalized_directories
+        session.debuginfod_enabled = debuginfod
+    return {
+        "source_substitutions": normalized_substitutions,
+        "debug_directories": (
+            normalized_directories if debug_directories is not None else None
+        ),
+        "debuginfod": debuginfod,
+        "replies": replies,
+    }
+
+
+@gdb_tool(states=NOT_RUNNING, read_only=True, idempotent=True)
+def gdb_debug_status(session_id: str) -> dict[str, Any]:
+    """Show source substitution, debug directory, sysroot, and debuginfod state."""
+    session = manager.get(session_id)
+    with session.command_lock:
+        return {
+            "substitute_path": _reply(session, "show substitute-path", 10),
+            "debug_file_directory": _reply(
+                session, "show debug-file-directory", 10
+            ),
+            "sysroot": _reply(session, "show sysroot", 10),
+            "debuginfod": _reply(session, "show debuginfod enabled", 10),
+        }
 
 
 # GDB/MI variable objects ---------------------------------------------------

@@ -46,7 +46,22 @@ MCP client calls for the lifetime of the server process; they do not pretend to
 survive a server restart. At a stop, use `gdb_context` for a compact atomic
 snapshot so evidence cannot be mixed across stop epochs.
 
-## Tools (73)
+For sink tracing, create `gdb_log_breakpoint`, run or continue normally, then
+page `gdb_log_read`; matching stops are captured and resumed inside the server.
+For crash work, `gdb_catch_crash` returns a retained execution job immediately
+unless `wait_timeout` is requested. Poll it with `gdb_execution_status` and
+cancel a timed-out/running watch with `gdb_execution_cancel`. Crash-job timeout
+does not secretly interrupt the target, matching ordinary execution-job
+semantics.
+
+`gdb_load_symbols_json` accepts `ghidra-decomp`, `exports`, and plain address/name
+inputs. It needs a local ELF mirror and GNU `objcopy`; for a stopped PIE it can
+infer the runtime image base from `gdb_modules`, while `base_address` remains
+available for remote layouts that cannot expose mappings. If Ghidra rebased the
+analysis image independently of the ELF link image, pass that value separately
+as `analysis_base_address`.
+
+## Tools (89)
 
 ### Session
 | Tool | Description |
@@ -69,6 +84,7 @@ snapshot so evidence cannot be mixed across stop epochs.
 | `gdb_execution_status` | Read or long-poll a retained execution job by revision |
 | `gdb_execution_list` | List the bounded per-session execution job history |
 | `gdb_execution_cancel` | Idempotently cancel an active/timed-out job by interrupting its target |
+| `gdb_catch_crash` | Continue under a retained fatal-signal filter and collect stop-pinned evidence |
 | `gdb_capabilities` | Discover and cache a normalized GDB/MI and target capability manifest |
 | `gdb_inferiors` | Refresh normalized inferior/thread-group topology and history |
 | `gdb_select_inferior` | Select an inferior by stable numeric ID |
@@ -79,8 +95,10 @@ snapshot so evidence cannot be mixed across stop epochs.
 |---|---|
 | `gdb_load_binary` | Load executable + optional args |
 | `gdb_attach` | Attach to PID |
-| `gdb_remote_connect` | Connect to gdbserver/QEMU/OpenOCD |
-| `gdb_remote_disconnect` | Disconnect from remote |
+| `gdb_remote_connect` | Connect to gdbserver/QEMU/OpenOCD, with optional compact notifications |
+| `gdb_remote_disconnect` | Disconnect from remote, with optional compact notifications |
+| `gdb_connect_profile` | Apply architecture/sysroot/endian setup and connect in one serialized call |
+| `gdb_rr_replay` | Launch an optional local rr replay server and connect to it |
 | `gdb_load_core` | Load core dump |
 | `gdb_add_symbol_file` | Load debug symbols |
 
@@ -94,13 +112,21 @@ snapshot so evidence cannot be mixed across stop epochs.
 | `gdb_next` | Step over (source or instruction) |
 | `gdb_finish` | Run until function returns |
 | `gdb_until` | Run until location |
-| `gdb_interrupt` | SIGINT the GDB process to regain control |
+| `gdb_interrupt` | Interrupt a running target and wait for a real stop epoch |
 | `gdb_signal` | Send signal to inferior |
+| `gdb_record_start` | Start `record btrace`/`record full`, with explicit automatic fallback |
+| `gdb_record_status` | Inspect the active GDB recording backend |
+| `gdb_record_stop` | Stop and discard the active recording |
+| `gdb_reverse` | Reverse continue/step/next/finish |
 
 ### Breakpoints
 | Tool | Description |
 |---|---|
-| `gdb_breakpoint` | Set breakpoint (conditional, temporary, hardware) |
+| `gdb_breakpoint` | Set one or up to 128 independently reported breakpoints |
+| `gdb_log_breakpoint` | Log expressions/backtraces at a breakpoint and auto-continue |
+| `gdb_log_read` | Cursor-page retained trace hits as JSON or JSONL |
+| `gdb_log_list` | List managed logging breakpoints and hit counts |
+| `gdb_log_delete` | Delete a logging breakpoint and retained evidence |
 | `gdb_delete_breakpoint` | Delete by number |
 | `gdb_enable_breakpoint` | Enable/disable |
 | `gdb_list_breakpoints` | List all |
@@ -156,6 +182,9 @@ snapshot so evidence cannot be mixed across stop epochs.
 | `gdb_info_sharedlibs` | Loaded shared libraries |
 | `gdb_info_files` | Sections and address ranges |
 | `gdb_info_proc_mappings` | Process memory map |
+| `gdb_modules` | Normalize mappings, ELF sections, build IDs, symbol files, and load slides |
+| `gdb_address_info` | Resolve runtime address/expression to module identity, linked VA, RVA, and section |
+| `gdb_load_symbols_json` | Convert Ghidra/plain address-name data to a temporary ELF symbol companion |
 
 ### Mutation
 | Tool | Description |
@@ -167,6 +196,8 @@ snapshot so evidence cannot be mixed across stop epochs.
 |---|---|
 | `gdb_set` | Set GDB option (ASLR, fork-mode, asm flavor, etc.) |
 | `gdb_show` | Show GDB option |
+| `gdb_debug_config` | Configure source substitutions, debug directories, and explicit debuginfod policy |
+| `gdb_debug_status` | Show source/split-debug/sysroot/debuginfod settings |
 
 ### Raw
 | Tool | Description |
@@ -185,16 +216,43 @@ snapshot so evidence cannot be mixed across stop epochs.
   output are bounded.
 - Execution jobs have monotonic revisions for efficient long polling, explicit
   terminal states, timeout-without-hidden-interrupt semantics, idempotent
-  cancellation, and bounded oldest-terminal eviction.
+  cancellation, and bounded oldest-terminal eviction. If a remote stub accepts
+  an interrupt but never reports a stop, cancellation returns a typed
+  `interrupt_timeout` and terminalizes the job as failed instead of leaving it
+  wedged in `cancelling`.
+- Managed logging breakpoints own only their matching breakpoint stops. They
+  capture bounded expression/backtrace evidence, auto-continue, and do not
+  advance the public stop epoch or terminate an execution job. Signal and
+  unrelated breakpoint stops remain visible. Collocated ordinary/managed or
+  managed/managed breakpoints are rejected because GDB/MI reports only one
+  breakpoint owner at a shared address.
+- Crash watches are retained execution jobs. Selected signal handling is made
+  explicit, evidence is collected under one stop-pinned command lock, and the
+  prior signal policy is restored before the job becomes terminal.
+- Command replies expose notification counts, summaries, and event-cursor
+  spans. Compact remote connect/disconnect replies omit the duplicate objects;
+  the bounded event stream remains available for detailed inspection.
+- Module evidence uses local ELF parsing for build IDs, debuglinks, sections,
+  and load-slide calculation. JSON symbol import invokes `objcopy` as a bounded
+  optional adapter and removes generated companions when the session closes.
 - Inferiors are tracked independently across fork, exec, partial exit, and
   selection. Local cleanup kills every active inferior instead of trusting one
   stale selected PID. Fork policy rolls back if a multi-setting update fails.
 - Capability discovery is cached per session, degrades individual failed probes
   into a manifest `errors` map, and is invalidated when target traits change.
+- A recording backend accepting `record full` does not prove every later target
+  instruction or syscall is recordable. Such target-specific failures surface
+  as ordinary stops with the original GDB diagnostics retained in the event
+  stream.
 - MCP tool annotations identify read-only, destructive, idempotent, and
   open-world calls. Server instructions advertise the low-call-count workflow.
 - Target cleanup defaults to kill for local inferiors, detach for attached
   processes, disconnect for remote targets, and quit for core/no-target sessions.
+
+Linux `gdbserver --attach` has a sharp edge in all-stop mode: some builds send
+Ctrl-C to process group `-PID`, which fails when the attached PID is not its
+group leader. Set `non-stop on` before `gdb_remote_connect` (or put that command
+in `gdb_connect_profile.commands`) to make GDB use the remote `vCtrlC` path.
 
 ## Development
 
@@ -206,5 +264,6 @@ python3 -m venv .venv
 
 The suite includes fake-controller race/failure tests plus real-GDB local,
 attach, `gdbserver`, core-dump, quoting, paging, retained-job A/B and edge cases,
-multi-inferior fork/exec, capability-cache A/B, burst output, and interactive
-inferior input.
+managed tracepoints, crash evidence, stripped-PIE symbol import, module/RVA
+identity, record/reverse execution, source/debug configuration, multi-inferior
+fork/exec, capability-cache A/B, burst output, and interactive inferior input.

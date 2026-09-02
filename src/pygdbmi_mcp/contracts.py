@@ -6,7 +6,7 @@ from typing import Any, Literal, TypedDict
 
 MCP_SCHEMA = "pygdbmi.mcp/1"
 ERROR_SCHEMA = "pygdbmi.error/1"
-CATALOG_REVISION = "2026-09-01.execution-topology.1"
+CATALOG_REVISION = "2026-09-02.research-workflows.1"
 
 
 class SessionSummary(TypedDict, total=False):
@@ -15,6 +15,7 @@ class SessionSummary(TypedDict, total=False):
     stop_id: int
     last_stop: dict[str, Any] | None
     binary: str | None
+    sysroot: str | None
     pid: int | None
     target_kind: str
     selected_thread: int | None
@@ -67,6 +68,10 @@ class CommandReply(TypedDict):
     next_offset: int | None
     truncated: bool
     notifications: list[dict[str, Any]]
+    notification_count: int
+    notification_summary: dict[str, int]
+    event_cursor_start: int
+    event_cursor_end: int
     elapsed_ms: float
 
 

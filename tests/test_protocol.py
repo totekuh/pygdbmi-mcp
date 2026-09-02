@@ -23,7 +23,7 @@ def test_stdio_protocol_catalog_envelopes_and_lifespan_cleanup() -> None:
                 initialized = await session.initialize()
                 assert "gdb_wait_for_stop" in initialized.instructions
                 catalog = await session.list_tools()
-                assert len(catalog.tools) == 73
+                assert len(catalog.tools) == 89
                 context = next(
                     tool for tool in catalog.tools if tool.name == "gdb_context"
                 )

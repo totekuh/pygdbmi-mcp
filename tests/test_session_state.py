@@ -20,6 +20,7 @@ from pygdbmi_mcp.runtime import (
     MAX_INFERIOR_IO,
     GdbManager,
     GdbSession,
+    _LogBreakpoint,
     _wire_command,
     cli_quote,
     mi_quote,
@@ -109,6 +110,7 @@ def test_token_correlates_result_and_routes_streams(fake_session) -> None:
         assert wire == "-gdb-version"
         fake.emit(
             record("console", None, "version line\n"),
+            record("notify", "library-loaded", {"id": "/tmp/libprobe.so"}),
             result(token + 900, "done", {"wrong": True}),
             result(token, "done", {"right": True}),
         )
@@ -118,7 +120,72 @@ def test_token_correlates_result_and_routes_streams(fake_session) -> None:
     assert reply["payload"] == {"right": True}
     assert reply["output"] == "version line\n"
     assert reply["command_id"] == 1
+    assert reply["notification_count"] == 1
+    assert reply["notification_summary"] == {"notify:library-loaded": 1}
+    assert reply["event_cursor_end"] > reply["event_cursor_start"]
     assert fake.writes == ["1-gdb-version"]
+
+
+def test_crash_signal_policy_and_evidence_bounds(fake_session) -> None:
+    _, session = fake_session
+    assert session._parse_signal_policy(
+        "SIGSEGV",
+        "Signal Stop Print Pass to program Description\nSIGSEGV Yes No Yes Segmentation fault\n",
+    ) == (True, False, True)
+    assert session._validate_crash_collect(
+        ["backtrace", "registers", "memory:(char *)$sp,0x40"]
+    ) == ["backtrace", "registers", "memory:(char *)$sp,64"]
+    with pytest.raises(GdbMcpError, match="4096"):
+        session._validate_crash_collect(["memory:$sp,4097"])
+
+
+def test_crash_policy_restore_verifies_remote_side_effect_after_error(
+    fake_session,
+) -> None:
+    fake, session = fake_session
+
+    def handler(token: int, wire: str) -> None:
+        if "handle SIGUSR1 nostop noprint pass" in wire:
+            fake.emit(
+                result(
+                    token,
+                    "error",
+                    {"msg": "Cannot execute this command while the target is running."},
+                )
+            )
+        elif "info handle SIGUSR1" in wire:
+            fake.emit(
+                record(
+                    "console",
+                    None,
+                    "Signal Stop Print Pass to program Description\n"
+                    "SIGUSR1 No No Yes User defined signal 1\n",
+                ),
+                result(token, "done"),
+            )
+        else:
+            raise AssertionError(wire)
+
+    fake.handler = handler
+    job = SimpleNamespace(
+        signal_policy_restored=False,
+        restore_signal_commands=("handle SIGUSR1 nostop noprint pass",),
+    )
+    assert session._restore_crash_signal_policy(job) == []
+    assert job.signal_policy_restored is True
+
+
+def test_crash_watch_rejects_running_state_before_touching_signal_policy(
+    fake_session,
+) -> None:
+    fake, session = fake_session
+    session.run_state = "running"
+    with pytest.raises(GdbMcpError) as caught:
+        session.start_crash_watch(
+            signals=["SIGUSR1"], collect=["backtrace"], timeout_sec=1
+        )
+    assert caught.value.code == "invalid_state"
+    assert fake.writes == []
 
 
 def test_gdb_error_is_typed_and_retains_reply(fake_session) -> None:
@@ -441,6 +508,88 @@ def test_execution_timeout_leaves_target_running_then_cancel_interrupts(
     assert session.run_state == "stopped"
     again = session.cancel_execution(job["job_id"], timeout_sec=1)
     assert again["already_terminal"] is True
+
+
+def test_failed_interrupt_terminalizes_cancelling_job(fake_session) -> None:
+    fake, session = fake_session
+
+    def handler(token: int, wire: str) -> None:
+        if wire == "-exec-run":
+            fake.emit(
+                result(token, "running"),
+                record("exec", "running", {"thread-id": "all"}),
+            )
+        elif wire == "-exec-interrupt --all":
+            # Some remote stubs acknowledge the request but never report a stop.
+            fake.emit(result(token, "done"))
+        else:
+            raise AssertionError(wire)
+
+    fake.handler = handler
+    job = session.start_execution("run", timeout_sec=0.02)
+    timed_out = session.execution_status(
+        job["job_id"], after_revision=job["revision"], wait_timeout=1
+    )
+    assert timed_out["state"] == "timed_out"
+
+    with pytest.raises(GdbMcpError) as caught:
+        session.cancel_execution(job["job_id"], timeout_sec=0.05)
+    assert caught.value.code == "interrupt_timeout"
+    failed_job = caught.value.details["job"]
+    assert failed_job["state"] == "failed"
+    assert failed_job["error"]["code"] == "cancel_failed"
+    assert failed_job["error"]["cause"]["code"] == "interrupt_timeout"
+    assert session.list_executions()["active_count"] == 0
+
+
+def test_interrupt_racing_managed_log_action_publishes_hidden_stop(
+    fake_session,
+) -> None:
+    fake, session = fake_session
+    trace = _LogBreakpoint(
+        log_id="log-1",
+        breakpoint_number="1",
+        location="tick",
+        expressions=("value",),
+        condition="",
+        hit_limit=10,
+        backtrace_depth=0,
+    )
+    session._log_breakpoints[trace.log_id] = trace
+    session._breakpoint_logs[trace.breakpoint_number] = trace.log_id
+    session.run_state = "running"
+    action_threads: list[threading.Thread] = []
+    stop = {
+        "reason": "breakpoint-hit",
+        "bkptno": "1",
+        "thread-id": "1",
+        "stopped-threads": "all",
+        "frame": {"addr": "0x401000", "func": "tick"},
+    }
+
+    def handler(token: int, wire: str) -> None:
+        if wire == "-exec-interrupt --all":
+            fake.emit(result(token, "done"))
+            thread = threading.Thread(
+                target=session._process_log_hit, args=(trace.log_id, stop)
+            )
+            action_threads.append(thread)
+            thread.start()
+        elif wire == '-data-evaluate-expression "value"':
+            fake.emit(result(token, "done", {"value": "7"}))
+        else:
+            raise AssertionError(wire)
+
+    fake.handler = handler
+    interrupted = session.interrupt(timeout_sec=1)
+    for thread in action_threads:
+        thread.join(timeout=1)
+    assert interrupted["reason"] == "stopped"
+    assert session.run_state == "stopped"
+    assert session.stop_id == 1
+    assert session.last_stop["managed-action-interrupted"] is True
+    assert trace.hit_count == 1
+    assert not any(write.endswith("-exec-continue") for write in fake.writes)
 
 
 def test_failed_execution_is_retained_with_job_id(fake_session) -> None:

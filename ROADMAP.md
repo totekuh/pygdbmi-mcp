@@ -63,6 +63,28 @@ clients benefit from prose errors was not a compatibility worth preserving.
 - Multi-inferior local cleanup addresses every active inferior. The selected
   child being dead is no longer enough to leak its living parent.
 
+## Shipped in 0.4
+
+- Managed logging breakpoints retain bounded expression and backtrace hits,
+  expose JSON/JSONL cursor pages, disable at a hit limit, and auto-continue
+  without publishing a false client-visible stop epoch.
+- Retained crash watches filter selected signals, make a previous `nostop`
+  policy temporarily explicit, atomically collect backtrace/general registers/
+  bounded memory, and restore the signal policy on capture, interruption, or
+  timeout.
+- Remote connect/disconnect notification compaction, inline architecture/
+  sysroot/endian connection profiles, and partial-success bulk breakpoint
+  insertion remove the repetitive agent round trips from embedded workflows.
+- Normalized mapping/module evidence ties runtime ranges to local ELF build IDs,
+  debuglinks, sections, symbol files, image bases, and calculated load slides.
+  Runtime addresses can be resolved to a module, linked VA, RVA, and section.
+- Bounded Ghidra/export/plain symbol import synthesizes a temporary companion
+  ELF through optional GNU `objcopy`, infers stopped-PIE relocation when
+  possible, and removes generated artifacts with the owning session.
+- Optional `rr` replay startup, explicit `record btrace`/`record full` fallback,
+  portable reverse execution, source substitution, split-debug directories,
+  debuglink/build-ID candidates, and opt-in debuginfod configuration.
+
 ## Completed — harden the MI boundary
 
 1. Persistent reader and numeric MI correlation — done.
@@ -87,25 +109,31 @@ clients benefit from prose errors was not a compatibility worth preserving.
 6. Multi-inferior/fork/exec state, selection, cleanup, and fork policy — shipped
    in 0.3.
 
-## P3 — reverse-engineering and post-mortem depth
+## Completed — reverse-engineering and post-mortem depth
 
 1. Normalize mappings, ELF sections, shared objects, build IDs, symbol files,
-   and relocation/load-slide evidence. Tie addresses to exact module identity.
+   and relocation/load-slide evidence. Tie addresses to exact module identity —
+   shipped in 0.4.
 2. Add bounded breakpoint command/action traces that auto-continue and retain a
    cursor-paged JSONL evidence stream, inspired by kdbg's conditional action
-   traces.
+   traces — shipped in 0.4.
 3. Add optional adapters for `rr`, GDB `record full`/`record btrace`, and reverse
    execution. Keep capability detection explicit because targets lie and old
-   GDB builds lie harder.
+   GDB builds lie harder — shipped in 0.4.
 4. Add source-path and split-debug helpers (`set substitute-path`, debuglink,
-   build-id directories, debuginfod status) with no hidden network fetches.
+   build-id directories, debuginfod status) with no hidden network fetches —
+   shipped in 0.4.
 5. Consider an optional static-analysis/decompiler bridge only after exact
    module identity and stop-pinned RVA mapping exist. It should be a separate
    service, never loaded into the MCP/GDB process, and cold analysis must not
-   hold a live inferior stopped.
-6. If session survival across MCP server restarts becomes necessary, add an
-   optional per-session broker process. Do not make a daemon mandatory merely
-   because kdbg needs one for QEMU's single RSP owner.
+   hold a live inferior stopped — shipped in 0.4 as a bounded JSON-to-companion-
+   ELF adapter process; no Ghidra/JVM is loaded into the MCP process.
+
+## Deferred until a workflow requires it
+
+- If session survival across MCP server restarts becomes necessary, add an
+  optional per-session broker process. Do not make a daemon mandatory merely
+  because kdbg needs one for QEMU's single RSP owner.
 
 ## Current verification
 
@@ -113,17 +141,21 @@ clients benefit from prose errors was not a compatibility worth preserving.
   results, reader death, stop epochs, cursor gaps, event/output bounds,
   concurrency, timeouts/recovery, cleanup policy, quoting, envelopes, schemas,
   annotations, constraints, and catalog size/identity.
-- Real-GDB coverage invokes all 73 tools across local run/stop/exit, attach and
-  detach, async interrupt, remote `gdbserver`, core files with spaces,
+- Real-GDB coverage invokes the 89-tool surface across local run/stop/exit,
+  attach and detach, async interrupt, remote `gdbserver` launch and attach,
+  all-stop/non-stop interrupt edges, core files with spaces,
   breakpoints/watchpoints/catchpoints, command paging, atomic batches, compact
   versus expanded context, settings restoration, variable objects, burst PTY
   output, interactive stdin, retained job timeout/cancel, cached capabilities,
-  multi-inferior selection, fork child/parent exit, and exec attribution.
+  multi-inferior selection, fork child/parent exit, exec attribution, managed
+  tracepoints, crash capture/policy restoration, connection profiles, compact
+  notifications, stripped-PIE symbol import, module/RVA evidence, record/reverse
+  execution, and source/split-debug configuration.
 - CI runs the suite on Python 3.10–3.13 with GDB, gdbserver, and GCC.
 
-Still worth adding: multi-thread non-stop regression targets, stripped PIE and
-split-debug fixtures, large C++ var-object trees, non-x86 architecture CI, and
-an optional process broker only if restart persistence becomes a real need.
+Still worth adding: multi-thread non-stop regression targets, split-debug
+fixtures, large C++ var-object trees, non-x86 architecture CI, and an optional
+process broker only if restart persistence becomes a real need.
 
 ## Non-goals
 

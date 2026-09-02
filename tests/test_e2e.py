@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -20,11 +21,15 @@ from pygdbmi_mcp.server import (
     gdb_capabilities,
     gdb_cast_print,
     gdb_catchpoint,
+    gdb_catch_crash,
     gdb_command,
     gdb_context,
+    gdb_connect_profile,
     gdb_continue,
     gdb_delete_breakpoint,
     gdb_disassemble,
+    gdb_debug_config,
+    gdb_debug_status,
     gdb_enable_breakpoint,
     gdb_events,
     gdb_execution_cancel,
@@ -48,10 +53,17 @@ from pygdbmi_mcp.server import (
     gdb_list_sessions,
     gdb_load_binary,
     gdb_load_core,
+    gdb_load_symbols_json,
+    gdb_log_breakpoint,
+    gdb_log_delete,
+    gdb_log_list,
+    gdb_log_read,
     gdb_locals,
     gdb_memory,
     gdb_memory_find,
     gdb_memory_write,
+    gdb_modules,
+    gdb_address_info,
     gdb_next,
     gdb_offsetof,
     gdb_output_page,
@@ -61,6 +73,10 @@ from pygdbmi_mcp.server import (
     gdb_registers,
     gdb_remote_connect,
     gdb_remote_disconnect,
+    gdb_record_start,
+    gdb_record_status,
+    gdb_record_stop,
+    gdb_reverse,
     gdb_run,
     gdb_select_frame,
     gdb_select_inferior,
@@ -147,7 +163,7 @@ class TestSessionAndErrors:
     def test_start_list_status_and_stop(self):
         started = ok(gdb_start())
         sid = started["session_id"]
-        assert started["catalog"]["tool_count"] == 73
+        assert started["catalog"]["tool_count"] == 89
         listing = ok(gdb_list_sessions())
         assert sid in {item["session_id"] for item in listing["sessions"]}
         current = status(sid)
@@ -240,6 +256,82 @@ class TestBreakpointsAndExecution:
         # Catchpoints are valid both before and at a stop.
         ok(gdb_catchpoint(session, "syscall write"))
 
+    def test_bulk_breakpoints_report_each_failure(self, session):
+        created = ok(
+            gdb_breakpoint(
+                session,
+                locations=["add", "factorial", "__pygdbmi_missing_symbol__"],
+            )
+        )
+        assert created["requested"] == 3
+        assert created["created"] == 2
+        assert created["failed"] == 1
+        assert [item["ok"] for item in created["items"]] == [True, True, False]
+
+    def test_logging_breakpoint_captures_and_auto_continues(self, session):
+        created = ok(
+            gdb_log_breakpoint(
+                session,
+                "add",
+                ["a", "b", "a + b"],
+                limit=1,
+                backtrace_depth=4,
+            )
+        )["log"]
+        baseline = status(session)["stop_id"]
+        execution = ok(gdb_execution_start(session, "run", timeout_sec=5))
+        if execution["state"] == "running":
+            execution = ok(
+                gdb_execution_status(
+                    session,
+                    execution["job_id"],
+                    after_revision=execution["revision"],
+                    wait_timeout=8,
+                )
+            )
+        assert execution["state"] == "exited"
+        page = ok(gdb_log_read(session, created["log_id"]))
+        assert page["hits"][0]["expressions"] == {"a": "3", "b": "4", "a + b": "7"}
+        assert page["hits"][0]["backtrace"][0]["func"] == "add"
+        assert page["log"]["enabled"] is False
+        assert status(session)["stop_id"] == baseline + 1
+        jsonl = ok(gdb_log_read(session, created["log_id"], encoding="jsonl"))
+        assert '"a + b":"7"' in jsonl["jsonl"]
+        assert ok(gdb_log_list(session))["count"] == 1
+        ok(gdb_log_delete(session, created["log_id"]))
+
+    def test_logging_breakpoints_reject_collocated_stop_owners(self, session):
+        created = ok(gdb_log_breakpoint(session, "add", ["a", "b"]))
+        trace = created["log"]
+        address = created["breakpoint"]["payload"]["bkpt"]["addr"]
+        failed(gdb_breakpoint(session, "add"), "breakpoint_conflict")
+        failed(
+            gdb_log_breakpoint(session, f"*{address}", ["$pc"]),
+            "breakpoint_conflict",
+        )
+
+        bulk = ok(gdb_breakpoint(session, locations=["add", "factorial"]))
+        assert [item["ok"] for item in bulk["items"]] == [False, True]
+        assert bulk["items"][0]["error"]["code"] == "breakpoint_conflict"
+        ok(
+            gdb_delete_breakpoint(
+                session,
+                int(bulk["items"][1]["reply"]["payload"]["bkpt"]["number"]),
+            )
+        )
+        ok(gdb_log_delete(session, trace["log_id"]))
+
+        ordinary = ok(gdb_breakpoint(session, "fill_point"))
+        failed(
+            gdb_log_breakpoint(session, "fill_point", ["p"]),
+            "breakpoint_conflict",
+        )
+        ok(
+            gdb_delete_breakpoint(
+                session, int(ordinary["payload"]["bkpt"]["number"])
+            )
+        )
+
     def test_signal_validation_and_delivery(self, session):
         break_and_run(session, "main")
         failed(gdb_signal(session, "SIGINT; shell id"), "invalid_argument")
@@ -305,6 +397,66 @@ class TestControlPlane:
             refreshed = ok(gdb_capabilities(sid, refresh=True))
             assert refreshed["cached"] is False
             assert refreshed["discovered_at"] >= discovered["discovered_at"]
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+
+    def test_crash_watch_filters_and_collects_atomic_evidence(self, binary_path):
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path, args=["crash"]))
+            ok(gdb_breakpoint(sid, "main"))
+            baseline = status(sid)["stop_id"]
+            ok(gdb_run(sid))
+            wait_after(sid, baseline)
+            ok(gdb_command(sid, "handle SIGSEGV nostop noprint pass"))
+            captured = ok(
+                gdb_catch_crash(
+                    sid,
+                    collect=["backtrace", "registers", "memory:$sp,64"],
+                    timeout_sec=5,
+                    wait_timeout=5,
+                )
+            )
+            assert captured["state"] == "crashed"
+            assert captured["evidence"]["stop"]["signal-name"] == "SIGSEGV"
+            assert captured["evidence"]["backtrace"]
+            assert captured["evidence"]["registers"]["pc" if "pc" in captured["evidence"]["registers"] else "rip"]
+            assert captured["evidence"]["memory"][0]["bytes"] == 64
+            assert captured["evidence"]["partial"] is False
+            policy = ok(gdb_command(sid, "info handle SIGSEGV"))["output"]
+            assert "SIGSEGV" in policy and "No\tNo\tYes" in policy
+            assert captured["signal_policy_restored"] is True
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+
+    def test_crash_watch_timeout_restores_signal_policy_without_interrupt(
+        self, binary_path
+    ):
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path, args=["loop"]))
+            ok(gdb_breakpoint(sid, "main"))
+            baseline = status(sid)["stop_id"]
+            ok(gdb_run(sid))
+            wait_after(sid, baseline)
+            ok(gdb_command(sid, "handle SIGUSR1 nostop noprint pass"))
+            watched = ok(
+                gdb_catch_crash(
+                    sid,
+                    signals=["SIGUSR1"],
+                    collect=["backtrace"],
+                    timeout_sec=0.05,
+                    wait_timeout=2,
+                )
+            )
+            assert watched["state"] == "timed_out"
+            assert watched["signal_policy_restored"] is True
+            assert status(sid)["run_state"] == "running"
+            policy = ok(gdb_command(sid, "info handle SIGUSR1"))["output"]
+            assert "SIGUSR1" in policy and "No\tNo\tYes" in policy
+            ok(gdb_execution_cancel(sid, watched["job_id"]))
         finally:
             if sid in manager.sessions:
                 ok(gdb_stop(sid))
@@ -609,6 +761,33 @@ class TestInspectionAndMemory:
         shown = ok(gdb_show(session, "listsize"))
         assert "17" in shown["output"]
 
+    def test_source_debug_config_recording_and_reverse_execution(
+        self, session, tmp_path
+    ):
+        break_and_run(session, "main")
+        configured = ok(
+            gdb_debug_config(
+                session,
+                source_substitutions=[{"from": "/build/source", "to": str(tmp_path)}],
+                debug_directories=["/usr/lib/debug"],
+            )
+        )
+        assert configured["debuginfod"] is False
+        debug_status = ok(gdb_debug_status(session))
+        assert "off" in debug_status["debuginfod"]["output"].lower()
+        assert str(tmp_path) in debug_status["substitute_path"]["output"]
+
+        recording = ok(gdb_record_start(session, method="full"))
+        assert recording["method"] == "full"
+        baseline = status(session)["stop_id"]
+        ok(gdb_next(session))
+        wait_after(session, baseline)
+        baseline = status(session)["stop_id"]
+        assert ok(gdb_reverse(session, action="next"))["result_class"] == "running"
+        wait_after(session, baseline)
+        assert "record-full" in ok(gdb_record_status(session))["output"]
+        ok(gdb_record_stop(session))
+
 
 class TestTypesSymbolsAndVarObjects:
     def test_type_and_symbol_queries(self, session):
@@ -641,6 +820,76 @@ class TestTypesSymbolsAndVarObjects:
         assert ok(gdb_print(session, "p->x"))["payload"]["value"] == "123"
         ok(gdb_var_delete(session, "watch_point"))
 
+    def test_module_identity_load_slide_and_address_resolution(self, session):
+        stopped = break_and_run(session, "main")
+        modules = ok(gdb_modules(session, include_sections=True))
+        main = next(
+            item
+            for item in modules["modules"]
+            if item["local_path"] and item["local_path"].endswith("test_binary")
+        )
+        assert main["build_id"]
+        assert isinstance(main["load_slide"], int)
+        assert any(item["name"] == ".text" for item in main["sections"])
+        resolved = ok(gdb_address_info(session, stopped["last_stop"]["frame"]["addr"]))
+        assert resolved["module"]["build_id"] == main["build_id"]
+        assert resolved["section"]["name"] == ".text"
+        assert isinstance(resolved["rva"], int)
+
+    def test_json_symbol_import_generates_companion_elf(
+        self, tmp_path, binary_path
+    ):
+        stripped = tmp_path / "stripped target"
+        shutil.copy2(binary_path, stripped)
+        subprocess.run(["strip", "--strip-all", stripped], check=True)
+        symbols = subprocess.run(
+            ["nm", "-n", binary_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        add_address = next(
+            line.split()[0] for line in symbols.splitlines() if line.endswith(" add")
+        )
+        symbol_json = tmp_path / "functions.json"
+        symbol_json.write_text(
+            json.dumps(
+                {
+                    "functions": [
+                        {
+                            "address": hex(int(add_address, 16) + 0x100000),
+                            "name": "imported_add",
+                        }
+                    ]
+                }
+            )
+        )
+        sid = ok(gdb_start())["session_id"]
+        artifact = None
+        try:
+            ok(gdb_load_binary(sid, str(stripped)))
+            baseline = status(sid)["stop_id"]
+            ok(gdb_command(sid, "starti"))
+            if status(sid)["run_state"] == "running":
+                wait_after(sid, baseline)
+            imported = ok(
+                gdb_load_symbols_json(
+                    sid,
+                    str(symbol_json),
+                    analysis_base_address="0x100000",
+                )
+            )
+            artifact = imported["artifact"]
+            assert imported["accepted"] == 1
+            assert imported["base_address_inferred"] is True
+            assert imported["analysis_base_address"] == 0x100000
+            assert Path(artifact).is_file()
+            assert "imported_add" in ok(gdb_info_functions(sid, "imported_add"))["output"]
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+        assert artifact is not None and not Path(artifact).exists()
+
 
 class TestAttachRemoteCoreAndInterrupt:
     def test_attach_interrupt_mappings_and_detach(self, binary_path):
@@ -666,6 +915,101 @@ class TestAttachRemoteCoreAndInterrupt:
             inferior.terminate()
             inferior.wait(timeout=5)
 
+    def test_gdbserver_attach_waits_for_real_stop_before_fast_cancel(
+        self, binary_path
+    ):
+        # gdbserver's all-stop Ctrl-C path signals -PID, so the attached
+        # process must own its process group for the stub to stop it.
+        inferior = subprocess.Popen([binary_path, "loop"], start_new_session=True)
+        server = subprocess.Popen(
+            [
+                "gdbserver",
+                "--once",
+                "--attach",
+                "localhost:0",
+                str(inferior.pid),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert server.stdout is not None
+        for _ in range(5):
+            line = server.stdout.readline()
+            if "Listening on port" in line:
+                break
+        assert "Listening on port" in line
+        port = line.rsplit(" ", 1)[-1].strip()
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path))
+            ok(gdb_remote_connect(sid, f"localhost:{port}", compact=True))
+            connected = status(sid)
+            assert connected["run_state"] == "stopped"
+            assert connected["stop_id"] > 0
+
+            started = ok(gdb_execution_start(sid, "continue", timeout_sec=0.05))
+            timed_out = ok(
+                gdb_execution_status(
+                    sid,
+                    started["job_id"],
+                    after_revision=started["revision"],
+                    wait_timeout=2,
+                )
+            )
+            assert timed_out["state"] == "timed_out"
+            cancelled = ok(gdb_execution_cancel(sid, timed_out["job_id"]))
+            assert cancelled["job"]["state"] == "cancelled"
+            assert status(sid)["run_state"] == "stopped"
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+            server.terminate()
+            server.wait(timeout=5)
+            inferior.terminate()
+            inferior.wait(timeout=5)
+
+    def test_gdbserver_attach_non_stop_interrupts_non_group_leader(
+        self, binary_path
+    ):
+        inferior = subprocess.Popen([binary_path, "loop"])
+        server = subprocess.Popen(
+            [
+                "gdbserver",
+                "--once",
+                "--attach",
+                "localhost:0",
+                str(inferior.pid),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert server.stdout is not None
+        for _ in range(5):
+            line = server.stdout.readline()
+            if "Listening on port" in line:
+                break
+        assert "Listening on port" in line
+        port = line.rsplit(" ", 1)[-1].strip()
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path))
+            ok(gdb_command(sid, "set non-stop on"))
+            ok(gdb_remote_connect(sid, f"localhost:{port}", compact=True))
+            before = status(sid)["stop_id"]
+            ok(gdb_continue(sid))
+            interrupted = ok(gdb_interrupt(sid, timeout_sec=5))
+            assert interrupted["reason"] == "stopped"
+            assert interrupted["session"]["stop_id"] > before
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+            server.terminate()
+            server.wait(timeout=5)
+            inferior.terminate()
+            inferior.wait(timeout=5)
+
     def test_remote_connect_continue_and_disconnect(self, binary_path):
         server = subprocess.Popen(
             ["gdbserver", "--once", "localhost:0", binary_path],
@@ -685,13 +1029,95 @@ class TestAttachRemoteCoreAndInterrupt:
         sid = ok(gdb_start())["session_id"]
         try:
             ok(gdb_load_binary(sid, binary_path))
-            ok(gdb_remote_connect(sid, f"localhost:{port}"))
+            connected = ok(gdb_remote_connect(sid, f"localhost:{port}", compact=True))
+            assert connected["notifications"] == []
+            assert connected["notifications_omitted"] == connected["notification_count"]
             assert status(sid)["target_kind"] == "remote"
             ok(gdb_breakpoint(sid, "main"))
             result = resume_and_wait(gdb_continue, sid)
             assert result["reason"] == "stopped"
-            ok(gdb_remote_disconnect(sid))
+            disconnected = ok(gdb_remote_disconnect(sid, compact=True))
+            assert disconnected["notifications"] == []
             assert status(sid)["target_kind"] == "none"
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+            server.terminate()
+            server.wait(timeout=5)
+
+    def test_inline_remote_connection_profile(self, binary_path):
+        server = subprocess.Popen(
+            ["gdbserver", "--once", "localhost:0", binary_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert server.stdout is not None
+        for _ in range(5):
+            line = server.stdout.readline()
+            if "Listening on port" in line:
+                break
+        assert "Listening on port" in line
+        port = line.rsplit(" ", 1)[-1].strip()
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path))
+            connected = ok(
+                gdb_connect_profile(
+                    sid,
+                    {
+                        "sysroot": "/",
+                        "target": f"localhost:{port}",
+                        "endian": "auto",
+                        "commands": ["set breakpoint pending off"],
+                    },
+                )
+            )
+            assert connected["profile"]["sysroot"] == "/"
+            assert connected["connected"]["notifications"] == []
+            assert status(sid)["target_kind"] == "remote"
+            assert status(sid)["sysroot"] == "/"
+        finally:
+            if sid in manager.sessions:
+                ok(gdb_stop(sid))
+            server.terminate()
+            server.wait(timeout=5)
+
+    def test_remote_crash_timeout_verifies_applied_signal_restore(self, binary_path):
+        server = subprocess.Popen(
+            ["gdbserver", "--once", "localhost:0", binary_path, "loop"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert server.stdout is not None
+        for _ in range(5):
+            line = server.stdout.readline()
+            if "Listening on port" in line:
+                break
+        assert "Listening on port" in line
+        port = line.rsplit(" ", 1)[-1].strip()
+        sid = ok(gdb_start())["session_id"]
+        try:
+            ok(gdb_load_binary(sid, binary_path))
+            ok(gdb_remote_connect(sid, f"localhost:{port}", compact=True))
+            ok(gdb_command(sid, "handle SIGUSR1 nostop noprint pass"))
+            watched = ok(
+                gdb_catch_crash(
+                    sid,
+                    signals=["SIGUSR1"],
+                    collect=["backtrace"],
+                    timeout_sec=0.05,
+                    wait_timeout=2,
+                )
+            )
+            assert watched["state"] == "timed_out"
+            assert watched["signal_policy_restored"] is True
+            assert watched["error"]["restore_errors"] == []
+            assert status(sid)["run_state"] == "running"
+            policy = ok(gdb_command(sid, "info handle SIGUSR1"))["output"]
+            assert "SIGUSR1" in policy and "No\tNo\tYes" in policy
+            ok(gdb_execution_cancel(sid, watched["job_id"]))
         finally:
             if sid in manager.sessions:
                 ok(gdb_stop(sid))

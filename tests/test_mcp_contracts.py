@@ -17,10 +17,12 @@ from pygdbmi_mcp.contracts import (
 )
 from pygdbmi_mcp.server import (
     gdb_batch,
+    gdb_breakpoint,
     gdb_command,
     gdb_context,
     gdb_load_core,
     gdb_memory,
+    gdb_rr_replay,
     gdb_var_children,
     manager,
     mcp,
@@ -141,6 +143,7 @@ def test_direct_tool_bounds_fail_before_reaching_gdb() -> None:
             gdb_batch("state-stub", "not-a-list"),  # type: ignore[arg-type]
             gdb_var_children("state-stub", "watch", 10, 9),
             gdb_var_children("state-stub", "watch", 0, 1000),
+            gdb_breakpoint("state-stub", locations=[]),
         ]
     finally:
         manager.sessions.pop("state-stub")
@@ -181,21 +184,33 @@ def test_core_load_does_not_retry_unrelated_failure(tmp_path) -> None:
     assert len([item for item in stub.commands if item.startswith("core-file")]) == 1
 
 
+def test_rr_adapter_reports_missing_executable(monkeypatch, tmp_path) -> None:
+    stub = StateStub("idle")
+    manager.sessions["state-stub"] = stub  # type: ignore[assignment]
+    monkeypatch.setattr("pygdbmi_mcp.server.shutil.which", lambda _: None)
+    try:
+        envelope = gdb_rr_replay("state-stub", str(tmp_path))
+    finally:
+        manager.sessions.pop("state-stub")
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "adapter_unavailable"
+
+
 def _tools():
     return asyncio.run(mcp.list_tools())
 
 
 def test_catalog_identity_count_and_shared_structured_output() -> None:
     tools = _tools()
-    assert len(tools) == 73
-    assert CATALOG_REVISION == "2026-09-01.execution-topology.1"
+    assert len(tools) == 89
+    assert CATALOG_REVISION == "2026-09-02.research-workflows.1"
     assert len({tool.name for tool in tools}) == len(tools)
     assert all(
         tool.outputSchema and tool.outputSchema["type"] == "object" for tool in tools
     )
     # Regression guard: do not repeat the full result schema for every tool.
     output_schema_chars = sum(len(json.dumps(tool.outputSchema)) for tool in tools)
-    assert output_schema_chars < 7000
+    assert output_schema_chars < len(tools) * 100
 
 
 def test_catalog_exposes_constraints_and_literal_enums() -> None:
@@ -226,6 +241,15 @@ def test_catalog_exposes_constraints_and_literal_enums() -> None:
     assert cancellation["timeout_sec"]["minimum"] == 0.05
     fork_policy = tools["gdb_fork_policy"].inputSchema["properties"]
     assert fork_policy["follow"]["enum"] == ["parent", "child"]
+    trace = tools["gdb_log_breakpoint"].inputSchema["properties"]
+    assert trace["limit"]["maximum"] == 100000
+    assert trace["backtrace_depth"]["maximum"] == 64
+    log_read = tools["gdb_log_read"].inputSchema["properties"]
+    assert log_read["encoding"]["enum"] == ["json", "jsonl"]
+    record = tools["gdb_record_start"].inputSchema["properties"]
+    assert record["method"]["enum"] == ["auto", "full", "btrace"]
+    reverse = tools["gdb_reverse"].inputSchema["properties"]
+    assert reverse["action"]["enum"] == ["continue", "step", "next", "finish"]
 
 
 @pytest.mark.parametrize(
@@ -242,6 +266,12 @@ def test_catalog_exposes_constraints_and_literal_enums() -> None:
         ("gdb_inferiors", True, False, True, False),
         ("gdb_fork_policy", False, True, True, False),
         ("gdb_capabilities", True, False, True, False),
+        ("gdb_log_read", True, False, True, False),
+        ("gdb_log_breakpoint", False, True, False, False),
+        ("gdb_catch_crash", False, True, False, False),
+        ("gdb_modules", True, False, True, True),
+        ("gdb_load_symbols_json", False, True, False, True),
+        ("gdb_debug_config", False, True, False, True),
     ],
 )
 def test_tool_annotations(
@@ -263,4 +293,7 @@ def test_server_instructions_define_efficient_workflow() -> None:
     assert "gdb_execution_status" in instructions
     assert "gdb_capabilities" in instructions
     assert "gdb_inferiors" in instructions
+    assert "gdb_log_breakpoint" in instructions
+    assert "gdb_catch_crash" in instructions
+    assert "gdb_modules" in instructions
     assert "check ok" in instructions
